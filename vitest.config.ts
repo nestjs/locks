@@ -10,6 +10,7 @@ export default defineConfig({
     },
   },
   test: {
+    globalSetup: ['tests/support/global-setup.ts'],
     include: ['tests/**/*.spec.ts'],
     globals: true,
     setupFiles: ['reflect-metadata'],
