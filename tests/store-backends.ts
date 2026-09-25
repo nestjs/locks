@@ -142,7 +142,7 @@ async function postgresBackend(): Promise<StoreBackend> {
     async (text, params) => (await pool.query(text, params)).rows,
     async () => {
       await pool.end();
-      postgres.stop();
+      await postgres.stop();
     },
   );
 }
