@@ -27,7 +27,7 @@ export function runInLockScope<T>(scope: LockScope, fn: () => T): T {
  * @WithoutOverlapping()
  * async reconcile() {
  *   const counts = await this.warehouse.stockCounts({ signal: this.locksContext.signal });
- *   await this.books.writeStock(counts, this.locksContext.fencingToken!);
+ *   await this.stockRepository.writeStock(counts, this.locksContext.fencingToken!);
  * }
  * ```
  */

@@ -329,13 +329,13 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
 
       @Injectable()
       class Exports {
-        @WithoutOverlapping({ key: 'books-table' })
-        exportBooks() {
+        @WithoutOverlapping({ key: 'products-table' })
+        exportProducts() {
           runs.push({ job: 'export', instance: 'a' });
           return gate;
         }
-        @WithoutOverlapping({ key: 'books-table' })
-        importBooks() {
+        @WithoutOverlapping({ key: 'products-table' })
+        importProducts() {
           runs.push({ job: 'import', instance: 'a' });
         }
       }
@@ -343,9 +343,9 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       apps.push(app);
       const hold = deferred();
       gate = hold.promise;
-      const exporting = app.get(Exports).exportBooks();
+      const exporting = app.get(Exports).exportProducts();
       await until(() => runs.length === 1);
-      expect(await app.get(Exports).importBooks()).toBeUndefined(); // the shared key excludes it
+      expect(await app.get(Exports).importProducts()).toBeUndefined(); // the shared key excludes it
       hold.resolve();
       await exporting;
     });
