@@ -16,7 +16,8 @@ import { decorateJob } from '../utils/job-decorator.util.js';
  *
  * It doesn't stop a run from overlapping the previous one on the owner (a plain `@Cron()`
  * doesn't either): add `@WithoutOverlapping()`. Inside the method, `LocksContext` has the
- * lease's fencing token and a signal that aborts if this instance loses the job.
+ * lease's fencing token and the run's signal, which aborts if this instance loses the job,
+ * and when the run ends.
  */
 export function OnOneInstance(options: OnOneInstanceOptions = {}): MethodDecorator {
   return decorateJob('oneInstance', '@OnOneInstance()', options);

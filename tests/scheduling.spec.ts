@@ -1,9 +1,12 @@
 import { Injectable, Module, Scope } from '@nestjs/common';
 import { Cron, Interval, SchedulerRegistry, Timeout } from '@nestjs/schedule';
 import { Test, type TestingModule } from '@nestjs/testing';
+import { getEventListeners } from 'node:events';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
 import { LocksContext } from '../lib/context/locks.context.js';
 import { LockLostError } from '../lib/errors/lock-lost.error.js';
+import type { Lock } from '../lib/lock/lock.js';
+import { Locks } from '../lib/locks.service.js';
 import { LocksModule } from '../lib/locks.module.js';
 import { OnOneInstance } from '../lib/decorators/on-one-instance.decorator.js';
 import { WithoutOverlapping } from '../lib/decorators/without-overlapping.decorator.js';
@@ -433,6 +436,26 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(runs[0]!.signal!.aborted).toBe(true);
     hold.resolve();
     await running;
+  });
+
+  it('gives each run a signal of its own, which aborts when the run ends and leaves nothing listening to the lease', async () => {
+    const { app, jobs } = await instance('a');
+    await jobs.nightly();
+    await jobs.reconcile();
+    await jobs.nightly();
+
+    expect(runs.map((r) => r.signal!.aborted)).toEqual([true, true, true]);
+    expect(runs[0]!.signal).not.toBe(runs[2]!.signal);
+    expect(runs[0]!.signal!.reason).toMatchObject({ name: 'AbortError', message: 'The run of ReportJobs.nightly ended' });
+    // A run under @WithoutOverlapping() ends with its lock's release.
+    expect(runs[1]!.signal!.reason).toMatchObject({ name: 'AbortError', message: 'The lock "ReportJobs.reconcile" was released' });
+    // The leases outlive the runs, with no listener of theirs left behind.
+    const leases = [...(app.get(Locks) as unknown as { held: Set<Lock> }).held];
+    expect(leases.map((lease) => [lease.key, lease.held]).sort()).toEqual([
+      ['ReportJobs.reconcile:owner', true],
+      ['reports:nightly:owner', true],
+    ]);
+    expect(leases.map((lease) => getEventListeners(lease.signal, 'abort').length)).toEqual([0, 0]);
   });
 });
 

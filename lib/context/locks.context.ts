@@ -45,8 +45,8 @@ export class LocksContext {
 
   /**
    * Aborts when the section should stop: its lock was lost or released, or, for a
-   * `@OnOneInstance()` job, this instance stopped owning the job. `undefined` outside a
-   * locked section.
+   * `@OnOneInstance()` job, this instance stopped owning the job. A job's run has a signal of
+   * its own, which also aborts when the run ends. `undefined` outside a locked section.
    */
   get signal(): AbortSignal | undefined {
     return scopes.getStore()?.signal;
