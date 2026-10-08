@@ -111,7 +111,11 @@ export class Lock {
     await (ms > 0 ? store.renew(key, owner, ms) : store.release(key, owner));
   }
 
-  /** The next timer: a renewal after `ttl / 3`, or the deadline if that comes first. */
+  /**
+   * The next timer: a renewal after `ttl / 3`, or at once when less than two of those are left
+   * (`acquire()` was answered late), so it has `ttl / 3` to land. While a renewal is in flight,
+   * the next beat, or the deadline if that comes first.
+   */
   private schedule() {
     const { clock, ttl } = this.internals;
     if (this.timer !== undefined) {
@@ -123,7 +127,8 @@ export class Lock {
     }
 
     const every = Math.max(1, Math.floor(ttl / 3));
-    const delay = Math.max(0, Math.min(every, this.deadline - clock.now()));
+    const remaining = this.deadline - clock.now();
+    const delay = this.renewing ? Math.max(0, Math.min(every, remaining)) : Math.max(1, Math.min(every, remaining - every));
     this.timer = clock.setTimeout(() => this.tick(), delay);
   }
 

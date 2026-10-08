@@ -223,6 +223,27 @@ describe('Locks: edge cases', () => {
       await lock.release();
     });
 
+    it('renews at once when it was granted with less than ttl / 3 left, rather than lose it at its deadline', async () => {
+      // The store took the lock when the call came in, and its answer took 800ms of the 1s ttl to come back.
+      class SlowAnswers extends InMemoryLockStore {
+        override async acquire(key: string, owner: string, ttl: number): Promise<LockAcquireResult> {
+          const result = await super.acquire(key, owner, ttl);
+          await clock.advance(800);
+          return result;
+        }
+      }
+      store = new SlowAnswers({ clock });
+      const { locks } = await instance({ ttl: 1_000 });
+      const renew = vi.spyOn(store, 'renew');
+      const lock = (await locks.acquire('k'))!;
+      await clock.advance(1);
+      expect(renew).toHaveBeenCalledTimes(1);
+      await clock.advance('1s');
+      expect(lock.held).toBe(true);
+      expect(store.peek('k')!.owner).toBe(lock.owner);
+      await lock.release();
+    });
+
     it('stops counting as held at its deadline, even if no timer has fired', async () => {
       // A clock whose timers never fire: an event loop blocked past the lease.
       let now = 0;
