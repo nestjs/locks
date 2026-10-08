@@ -194,15 +194,17 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
       }
 
       const lock = (runLock ?? ownership)!;
-      const signal = runLock && ownership ? AbortSignal.any([runLock.signal, ownership.signal]) : lock.signal;
+      const scope = runSignal([runLock, ownership].flatMap((held) => (held ? [held.signal] : [])));
       state.lastStartedAt = internals.clock.now();
 
       try {
-        return await runInLockScope({ lock, signal }, invoke);
+        return await runInLockScope({ lock, signal: scope.signal }, invoke);
       } finally {
         await runLock?.release().catch((error: unknown) => {
           this.logger.error(`Could not release the lock "${state.key}" after ${job}`, (error as Error)?.stack ?? String(error));
         });
+        // After the release, so the run lock's signal gives its reason first.
+        scope.end(new DOMException(`The run of ${job} ended`, 'AbortError'));
       }
     };
 
@@ -216,4 +218,32 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
       },
     };
   }
+}
+
+/**
+ * A run's own signal: it aborts with the first of `sources` (its locks' signals) to abort, or at `end()`, when the run
+ * ends, and listens to them only while the run lasts. A lease outlives every run, so what runs left listening to its
+ * signal would pile up; and not `AbortSignal.any()`, as on Node 20, 22 and early 24 a source keeps each signal derived
+ * from it reachable, and, once anything listened to one, keeps it for good.
+ */
+function runSignal(sources: AbortSignal[]): { signal: AbortSignal; end(reason: unknown): void } {
+  const controller = new AbortController();
+  const forward = (event: Event) => controller.abort((event.target as AbortSignal).reason);
+  const aborted = sources.find((source) => source.aborted);
+  if (aborted) {
+    controller.abort(aborted.reason);
+  }
+  for (const source of sources) {
+    source.addEventListener('abort', forward, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    end: (reason) => {
+      for (const source of sources) {
+        source.removeEventListener('abort', forward);
+      }
+      controller.abort(reason);
+    },
+  };
 }
