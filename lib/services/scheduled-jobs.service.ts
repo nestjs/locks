@@ -194,12 +194,13 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
       }
 
       const lock = (runLock ?? ownership)!;
-      const signal = runLock && ownership ? AbortSignal.any([runLock.signal, ownership.signal]) : lock.signal;
+      const scope = runLock && ownership ? runSignal(runLock.signal, ownership.signal) : { signal: lock.signal, unlink() {} };
       state.lastStartedAt = internals.clock.now();
 
       try {
-        return await runInLockScope({ lock, signal }, invoke);
+        return await runInLockScope({ lock, signal: scope.signal }, invoke);
       } finally {
+        scope.unlink();
         await runLock?.release().catch((error: unknown) => {
           this.logger.error(`Could not release the lock "${state.key}" after ${job}`, (error as Error)?.stack ?? String(error));
         });
@@ -216,4 +217,23 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
       },
     };
   }
+}
+
+/**
+ * A signal that aborts with the first of `run` and `lease` to abort, and `unlink()`, which stops listening to `lease`
+ * (`run` ends with the run). Not `AbortSignal.any()`: the lease outlives every run, and on Node 20 and 22 it keeps
+ * each signal derived from it reachable, and, once anything listened to one, keeps it for good.
+ */
+function runSignal(run: AbortSignal, lease: AbortSignal): { signal: AbortSignal; unlink(): void } {
+  const controller = new AbortController();
+  const aborted = [run, lease].find((source) => source.aborted);
+  if (aborted) {
+    controller.abort(aborted.reason);
+    return { signal: controller.signal, unlink() {} };
+  }
+
+  const forward = (event: Event) => controller.abort((event.target as AbortSignal).reason);
+  run.addEventListener('abort', forward, { once: true });
+  lease.addEventListener('abort', forward, { once: true });
+  return { signal: controller.signal, unlink: () => lease.removeEventListener('abort', forward) };
 }
