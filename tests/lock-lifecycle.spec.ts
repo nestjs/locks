@@ -9,7 +9,7 @@ import type { LockAcquireResult } from '../lib/interfaces/lock-store.interface.j
 import { Locks } from '../lib/locks.service.js';
 import { InMemoryLockStore } from '../lib/stores/in-memory-lock.store.js';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
-import { CapturingLogger, startInstance } from './helpers.js';
+import { CapturingLogger, startInstance, until } from './helpers.js';
 
 /** Whether `promise` has settled, without waiting for it. */
 async function settled(promise: Promise<unknown>): Promise<boolean> {
@@ -223,6 +223,27 @@ describe('Locks: edge cases', () => {
       await lock.release();
     });
 
+    it('renews at once when it was granted with less than ttl / 3 left, rather than lose it at its deadline', async () => {
+      // The store took the lock when the call came in, and its answer took 800ms of the 1s ttl to come back.
+      class SlowAnswers extends InMemoryLockStore {
+        override async acquire(key: string, owner: string, ttl: number): Promise<LockAcquireResult> {
+          const result = await super.acquire(key, owner, ttl);
+          await clock.advance(800);
+          return result;
+        }
+      }
+      store = new SlowAnswers({ clock });
+      const { locks } = await instance({ ttl: 1_000 });
+      const renew = vi.spyOn(store, 'renew');
+      const lock = (await locks.acquire('k'))!;
+      await clock.advance(1);
+      expect(renew).toHaveBeenCalledTimes(1);
+      await clock.advance('1s');
+      expect(lock.held).toBe(true);
+      expect(store.peek('k')!.owner).toBe(lock.owner);
+      await lock.release();
+    });
+
     it('stops counting as held at its deadline, even if no timer has fired', async () => {
       // A clock whose timers never fire: an event loop blocked past the lease.
       let now = 0;
@@ -350,6 +371,32 @@ describe('Locks: edge cases', () => {
       expect(error).toBeInstanceOf(TypeError);
       expect((error as Error).message).toBe(`BadTokens.acquire() must resolve fencingToken as a positive safe integer, ${message}`);
       expect(store.peek('k')).toBeUndefined();
+    });
+
+    it('that grants a lock only after its ttl ran out: it is given back, not handed out, and acquire() tries again', async () => {
+      // The call reaches the store, and the store takes the lock, 1.5s after it was sent: a failover, a paused container.
+      const stalls = [1_500, 1_500];
+      class Stalled extends InMemoryLockStore {
+        override async acquire(key: string, owner: string, ttl: number): Promise<LockAcquireResult> {
+          await clock.advance(stalls.shift() ?? 0);
+          return super.acquire(key, owner, ttl);
+        }
+      }
+      store = new Stalled({ clock });
+      const { locks } = await instance({ ttl: 1_000 });
+      const fn = vi.fn();
+
+      expect(await locks.acquire('k')).toBeNull();
+      expect(store.peek('k')).toBeUndefined();
+      expect(logger.matching('WARN The store granted the lock "k" 1500ms after acquire() was sent, past its 1000ms ttl: gave it back.')).toHaveLength(1);
+      await expect(locks.withLock('k', fn)).rejects.toBeInstanceOf(LockNotAcquiredError);
+      expect(fn).not.toHaveBeenCalled();
+
+      stalls.push(1_500);
+      const waiting = locks.acquire('k', { wait: '10s' });
+      await until(() => logger.matching('gave it back').length === 3);
+      await clock.advance('1s'); // the backoff: the next attempt is answered in time
+      expect((await waiting)?.held).toBe(true);
     });
 
     it('that fails acquire() rejects acquire() and withLock() with its error', async () => {

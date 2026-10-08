@@ -69,7 +69,8 @@ export class Locks implements BeforeApplicationShutdown {
   /**
    * Takes the lock on `key`, waiting up to `wait` for another holder to give it back.
    * Resolves the `Lock` (it renews itself until you release it), or `null` if another holder
-   * kept it. Rejects when the store fails, and with `signal`'s reason when it aborts.
+   * kept it, or the store only granted it after `ttl` (the lease ran out on the way). Rejects
+   * when the store fails, and with `signal`'s reason when it aborts.
    */
   async acquire(key: string, options: LockOptions = {}): Promise<Lock | null> {
     const { ttl, wait } = this.resolve(key, options);
@@ -168,6 +169,16 @@ export class Locks implements BeforeApplicationShutdown {
         `${nameOf(store)}.acquire() must resolve fencingToken as a positive safe integer, got ${JSON.stringify(fencingToken)} ` +
           `(${typeof fencingToken})${typeof fencingToken === 'string' ? ': PostgreSQL returns bigint columns as strings, convert it with Number()' : ''}`,
       );
+    }
+
+    // Granted after its ttl ran out here (a failover, a paused store, a saturated pool): this
+    // process would count it lost at once, and its caller would run on a lease the store may
+    // have handed on. Give it back, so the key isn't blocked for a ttl, and report it as taken.
+    const elapsed = this.clock.now() - sentAt;
+    if (elapsed >= ttl) {
+      await store.release(key, owner).catch(() => undefined);
+      this.logger.warn(`The store granted the lock "${key}" ${elapsed}ms after acquire() was sent, past its ${ttl}ms ttl: gave it back.`);
+      return null;
     }
 
     const lock = new Lock({
