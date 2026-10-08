@@ -438,6 +438,21 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     await running;
   });
 
+  it('skips the ticks that waited on a lease the store granted after its ttl, instead of running them all', async () => {
+    const { jobs } = await instance('a');
+    const acquire = store.acquire.bind(store);
+    vi.spyOn(store, 'acquire').mockImplementationOnce(async (key, owner, ttl) => {
+      await clock.advance('31s'); // a database failover: the call reaches the store 31s late
+      return acquire(key, owner, ttl);
+    });
+
+    expect(await Promise.all([jobs.nightly(), jobs.nightly(), jobs.nightly()])).toEqual([undefined, undefined, undefined]);
+    expect(runs).toEqual([]);
+    expect(store.peek('reports:nightly:owner')).toBeUndefined();
+    expect(logger.matching('DEBUG Skipped ReportJobs.nightly: it runs on another instance')).toHaveLength(3);
+    expect(await jobs.nightly()).toBe('done'); // the next tick, answered in time
+  });
+
   it('gives each run a signal of its own, which aborts when the run ends and leaves nothing listening to the lease', async () => {
     const { app, jobs } = await instance('a');
     await jobs.nightly();
