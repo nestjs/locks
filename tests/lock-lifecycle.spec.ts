@@ -9,7 +9,7 @@ import type { LockAcquireResult } from '../lib/interfaces/lock-store.interface.j
 import { Locks } from '../lib/locks.service.js';
 import { InMemoryLockStore } from '../lib/stores/in-memory-lock.store.js';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
-import { CapturingLogger, startInstance, until } from './helpers.js';
+import { CapturingLogger, deferred, startInstance, until } from './helpers.js';
 
 /** Whether `promise` has settled, without waiting for it. */
 async function settled(promise: Promise<unknown>): Promise<boolean> {
@@ -96,6 +96,101 @@ describe('Locks: edge cases', () => {
       await expect(locks.acquire('k', { signal: AbortSignal.abort(new Error('gone')) })).rejects.toThrow('gone');
       await expect(locks.withLock('k', () => 1, { signal: AbortSignal.abort(new Error('gone')) })).rejects.toThrow('gone');
       expect(acquire).not.toHaveBeenCalled();
+    });
+
+    describe('on a store that has yet to answer', () => {
+      /** Holds the store's next acquire() until `answer` settles: a saturated pool, a failover. */
+      function stall() {
+        const answer = deferred();
+        const acquire = store.acquire.bind(store);
+        const owners: string[] = [];
+        vi.spyOn(store, 'acquire').mockImplementationOnce(async (key, owner, ttl) => {
+          owners.push(owner);
+          await answer.promise;
+          return acquire(key, owner, ttl);
+        });
+        return { answer, owners, release: vi.spyOn(store, 'release') };
+      }
+
+      it.each([
+        ['no wait', {}],
+        ['a wait', { wait: '1m' }],
+      ] as const)('stops waiting when the signal aborts, with %s, and gives back the lock the store grants later', async (_, options) => {
+        const { locks } = await instance();
+        const { answer, owners, release } = stall();
+        const controller = new AbortController();
+        const acquiring = locks.acquire('k', { ...options, signal: controller.signal });
+        expect(await settled(acquiring)).toBe(false);
+
+        controller.abort(new Error('client went away'));
+        await expect(acquiring).rejects.toThrow('client went away');
+
+        answer.resolve();
+        await until(() => release.mock.calls.length === 1);
+        expect(release).toHaveBeenCalledWith('k', owners[0]);
+        expect(store.peek('k')).toBeUndefined();
+        expect(await locks.acquire('k')).not.toBeNull();
+      });
+
+      it("doesn't run the callback of withLock() when the signal aborted before the store granted the lock", async () => {
+        const { locks } = await instance();
+        const { answer } = stall();
+        const controller = new AbortController();
+        const fn = vi.fn();
+        const running = locks.withLock('k', fn, { signal: controller.signal });
+
+        controller.abort(new Error('client went away'));
+        answer.resolve();
+        await expect(running).rejects.toThrow('client went away');
+        await until(() => store.peek('k') === undefined);
+        expect(fn).not.toHaveBeenCalled();
+      });
+
+      it('ignores a store failure that arrives after the signal aborted', async () => {
+        const { locks } = await instance();
+        const { answer, release } = stall();
+        const controller = new AbortController();
+        const acquiring = locks.acquire('k', { signal: controller.signal });
+
+        controller.abort(new Error('client went away'));
+        answer.reject(new Error('ECONNRESET'));
+        await expect(acquiring).rejects.toThrow('client went away');
+        await clock.advance(0);
+        expect(release).not.toHaveBeenCalled();
+      });
+
+      it('leaves nothing listening to the signal once the store answers', async () => {
+        const { locks } = await instance();
+        const { answer } = stall();
+        const controller = new AbortController();
+        const add = vi.spyOn(controller.signal, 'addEventListener');
+        const remove = vi.spyOn(controller.signal, 'removeEventListener');
+        const acquiring = locks.acquire('k', { signal: controller.signal });
+
+        answer.resolve();
+        const lock = (await acquiring)!;
+        expect(lock.held).toBe(true);
+        expect(remove.mock.calls.map(([, listener]) => listener)).toEqual(add.mock.calls.map(([, listener]) => listener));
+        controller.abort();
+        expect(lock.signal.aborted).toBe(false);
+      });
+    });
+
+    it('asks the store with a new owner at each attempt, so a late grant can only give back its own lock', async () => {
+      const other = await instance();
+      const { locks } = await instance();
+      const holder = (await other.locks.acquire('k'))!;
+      const acquire = vi.spyOn(store, 'acquire');
+      const waiting = locks.acquire('k', { wait: '1s' });
+      await clock.advance('500ms');
+      await holder.release();
+      await clock.advance('500ms');
+      const lock = (await waiting)!;
+
+      const owners = acquire.mock.calls.map(([, owner]) => owner);
+      expect(owners.length).toBeGreaterThan(2);
+      expect(new Set(owners).size).toBe(owners.length);
+      expect(owners.at(-1)).toBe(lock.owner);
     });
 
     it('wakes every waiter in this process at a release: one takes the lock, the other waits on', async () => {
