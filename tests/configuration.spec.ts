@@ -80,6 +80,15 @@ describe('LocksModule options', () => {
     );
   });
 
+  it('fails at startup on a bad storeTimeout, naming the option', async () => {
+    await expect(compile([LocksModule.forRoot({ storeTimeout: 'soon' as never })])).rejects.toThrow(
+      'LocksModule: `storeTimeout`: Invalid duration "soon"',
+    );
+    await expect(compile([LocksModule.forRoot({ storeTimeout: 0 })])).rejects.toThrow(
+      'LocksModule: `storeTimeout` must be at least 1ms, got 0',
+    );
+  });
+
   it('is not global with forRootAsync({ isGlobal: false })', async () => {
     @Injectable()
     class Consumer {

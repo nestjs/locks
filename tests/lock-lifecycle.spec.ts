@@ -1,7 +1,7 @@
 import type { TestingModule } from '@nestjs/testing';
 import { subscribe, unsubscribe } from 'node:diagnostics_channel';
 import { LocksContext } from '../lib/context/locks.context.js';
-import { LockLostError, LockNotAcquiredError, LocksError } from '../lib/errors/index.js';
+import { LockLostError, LockNotAcquiredError, LocksError, LockStoreTimeoutError } from '../lib/errors/index.js';
 import type { LocksEvent } from '../lib/events/locks-events.interface.js';
 import { LocksEvents } from '../lib/events/locks-events.service.js';
 import type { LockClock } from '../lib/interfaces/lock-clock.interface.js';
@@ -492,6 +492,99 @@ describe('Locks: edge cases', () => {
       await until(() => logger.matching('gave it back').length === 3);
       await clock.advance('1s'); // the backoff: the next attempt is answered in time
       expect((await waiting)?.held).toBe(true);
+    });
+
+    describe('that never answers', () => {
+      const never = () => new Promise<never>(() => undefined);
+
+      it('fails acquire() and withLock() with LockStoreTimeoutError after storeTimeout, and gives back a lock it grants later', async () => {
+        const { locks } = await instance();
+        const answer = deferred();
+        const acquire = store.acquire.bind(store);
+        vi.spyOn(store, 'acquire').mockImplementationOnce(async (key, owner, ttl) => {
+          await answer.promise;
+          return acquire(key, owner, ttl);
+        });
+        const release = vi.spyOn(store, 'release');
+        const acquiring = locks.acquire('k', { wait: '1m' });
+        await clock.advance(9_999);
+        expect(await settled(acquiring)).toBe(false);
+        await clock.advance(1);
+        const error = await acquiring.catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(LockStoreTimeoutError);
+        expect(error).toBeInstanceOf(LocksError);
+        expect(error).toMatchObject({
+          key: 'k',
+          method: 'acquire',
+          timeoutMs: 10_000,
+          message: 'InMemoryLockStore.acquire() for the lock "k" did not answer within 10000ms (storeTimeout)',
+        });
+
+        answer.resolve();
+        await until(() => release.mock.calls.length === 1);
+        expect(store.peek('k')).toBeUndefined();
+
+        vi.spyOn(store, 'acquire').mockReturnValueOnce(never());
+        const fn = vi.fn();
+        const running = expect(locks.withLock('k', fn)).rejects.toBeInstanceOf(LockStoreTimeoutError);
+        await clock.advance('10s');
+        await running;
+        expect(fn).not.toHaveBeenCalled();
+      });
+
+      it('times out a renewal, logs it, and renews at the next beat', async () => {
+        const { locks } = await instance();
+        const lock = (await locks.acquire('k', { ttl: '30s' }))!;
+        const renew = vi.spyOn(store, 'renew').mockReturnValueOnce(never());
+        await clock.advance('20s'); // sent at 10s, timed out at 20s, sent again at 20s
+        expect(logger.matching('ERROR Could not renew the lock "k"')).toHaveLength(1);
+        expect(renew).toHaveBeenCalledTimes(2);
+        expect(lock.held).toBe(true);
+        await clock.advance('5m');
+        expect(lock.held).toBe(true);
+      });
+
+      it('gives back, once, a lock that timed-out renewals renew after it was lost', async () => {
+        const { locks } = await instance();
+        const lock = (await locks.acquire('k', { ttl: '30s' }))!;
+        const stuck = deferred<boolean>();
+        vi.spyOn(store, 'renew').mockReturnValue(stuck.promise);
+        await clock.advance('30s');
+        expect(lock.signal.reason).toMatchObject({ name: 'LockLostError', detectedBy: 'deadline' });
+
+        const release = vi.spyOn(store, 'release');
+        stuck.resolve(true); // both renewals land after all
+        await until(() => release.mock.calls.length > 0);
+        await clock.advance(0);
+        expect(release.mock.calls).toEqual([['k', lock.owner]]);
+      });
+
+      it('times out release(): withLock() logs it and returns, and shutdown finishes', async () => {
+        const { app, locks } = await instance();
+        vi.spyOn(store, 'release').mockReturnValue(never());
+        const running = locks.withLock('k', () => 'done');
+        await clock.advance('10s');
+        expect(await running).toBe('done');
+        expect(logger.matching('ERROR Could not release the lock "k"')).toHaveLength(1);
+
+        await locks.acquire('other');
+        apps.splice(apps.indexOf(app), 1);
+        const closing = app.close();
+        await clock.advance('10s');
+        await closing;
+        expect(logger.matching('ERROR Could not release the lock "other" at shutdown')).toHaveLength(1);
+      });
+
+      it('fails at once when the signal aborts before storeTimeout', async () => {
+        const { locks } = await instance();
+        vi.spyOn(store, 'acquire').mockReturnValueOnce(never());
+        const controller = new AbortController();
+        const acquiring = locks.acquire('k', { signal: controller.signal });
+        await clock.advance('5s');
+        controller.abort(new Error('client went away'));
+        await expect(acquiring).rejects.toThrow('client went away');
+        expect(clock.pendingTimers).toBe(0); // the storeTimeout timer is gone
+      });
     });
 
     it('that fails acquire() rejects acquire() and withLock() with its error', async () => {

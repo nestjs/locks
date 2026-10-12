@@ -31,17 +31,20 @@ class KeyState {
   }
 
   /** The lease on the job: this instance's if it holds it or can take it now, else `null`. */
-  ensureOwnership(ttl: number, job: string): Promise<Lock | null> {
+  ensureOwnership(ttl: number, job: string, signal: AbortSignal): Promise<Lock | null> {
     if (this.ownership?.held) {
       return Promise.resolve(this.ownership);
     }
 
     this.ownership = undefined;
     this.acquiring ??= this.locks
-      .tryAcquire(this.ownerKey, ttl, (lost) => {
-        if (this.ownership === lost) {
-          this.ownership = undefined;
-        }
+      .tryAcquire(this.ownerKey, ttl, {
+        onLost: (lost) => {
+          if (this.ownership === lost) {
+            this.ownership = undefined;
+          }
+        },
+        signal,
       })
       .then((lock) => {
         if (lock) {
@@ -68,6 +71,8 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger('Locks');
   private readonly states = new Map<string, KeyState>();
   private readonly pending = new Set<Promise<unknown>>();
+  /** Aborts at shutdown: a tick still waiting for its locks stops waiting for the store. */
+  private readonly shutdown = new AbortController();
   private stopping = false;
 
   constructor(
@@ -125,9 +130,13 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Runs in progress finish (they keep their locks), then the leases go back. */
+  /**
+   * Runs in progress finish (they keep their locks), ticks still waiting for the store to
+   * grant theirs don't run, then the leases go back.
+   */
   async onModuleDestroy() {
     this.stopping = true;
+    this.shutdown.abort(new DOMException('The application is shutting down', 'AbortError'));
     await Promise.allSettled(this.pending);
     const { clock } = this.locks[LOCKS_INTERNALS];
     await Promise.all(
@@ -175,18 +184,24 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
 
       try {
         if (definition.oneInstance) {
-          ownership = await state.ensureOwnership(definition.oneInstance.ttl ?? internals.defaultTtl, job);
+          ownership = await state.ensureOwnership(definition.oneInstance.ttl ?? internals.defaultTtl, job, this.shutdown.signal);
           if (!ownership) {
             return skip('it runs on another instance');
           }
         }
         if (definition.withoutOverlapping) {
-          runLock = await internals.tryAcquire(state.key, definition.withoutOverlapping.ttl ?? internals.defaultTtl);
+          runLock = await internals.tryAcquire(state.key, definition.withoutOverlapping.ttl ?? internals.defaultTtl, {
+            signal: this.shutdown.signal,
+          });
           if (!runLock) {
             return skip('a run is still in progress');
           }
         }
       } catch (error) {
+        if (error === this.shutdown.signal.reason) {
+          // Shutdown stopped the wait for the store; a lock it grants later goes back.
+          return skip('the application is shutting down');
+        }
         // Fail closed: without the lock, running could mean running twice.
         throw new Error(`${job} did not run: the lock store failed (${(error as Error)?.message ?? String(error)})`, {
           cause: error,

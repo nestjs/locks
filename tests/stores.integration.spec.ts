@@ -130,10 +130,19 @@ for (const backend of backends) {
       backend.beforeInit(app);
       const events: LocksEvent[] = [];
       app.get(LocksEvents).events$.subscribe((event) => events.push(event));
+      const acquire = vi.spyOn(backend.storeOf(app), 'acquire');
       await app.init();
       apps.push(app);
 
-      return { name, app, clock, events, locks: app.get(Locks) };
+      /**
+       * The store answered every acquire() sent so far, and `clock` has `timers` left: the
+       * instance waits on its next try. A call in flight has a storeTimeout timer of its own, so
+       * the count alone doesn't tell.
+       */
+      const idle = (timers: number) =>
+        acquire.mock.settledResults.every(({ type }) => type !== 'incomplete') && clock.pendingTimers === timers;
+
+      return { name, app, clock, events, locks: app.get(Locks), idle };
     }
 
     async function stop(app: TestingModule) {
@@ -173,6 +182,7 @@ for (const backend of backends) {
       for (const app of apps.splice(0)) {
         await app.close();
       }
+      vi.restoreAllMocks();
     });
 
     it('boots every instance on the store, which registered itself', async () => {
@@ -227,7 +237,7 @@ for (const backend of backends) {
       const b = await instance('b');
       const held = await a.locks.acquire('reports:monthly');
       const waiting = b.locks.acquire('reports:monthly', { wait: '5s' });
-      await until(() => b.clock.pendingTimers === 1); // B tried once, and sleeps on its backoff
+      await until(() => b.idle(1)); // B tried once, and sleeps on its backoff
 
       expect(await held!.release()).toBe(true);
       await b.clock.advance('1s');
@@ -336,7 +346,7 @@ for (const backend of backends) {
       await until(() => leadership.length === 1);
       const b = await instance('b', [WarehouseFeed]);
       const c = await instance('c', [WarehouseFeed]);
-      await until(() => b.clock.pendingTimers === 1 && c.clock.pendingTimers === 1); // their campaigns were refused
+      await until(() => b.idle(1) && c.idle(1)); // their campaigns were refused
 
       const leader = a.app.get(WarehouseFeed).lock!;
       expect(leadership).toEqual([`a leads (token ${leader.fencingToken})`]);
@@ -373,7 +383,7 @@ for (const backend of backends) {
       const a = await instance('a', [WarehouseFeed]);
       await until(() => leadership.length === 1);
       const b = await instance('b', [WarehouseFeed]);
-      await until(() => b.clock.pendingTimers === 1);
+      await until(() => b.idle(1));
       const stale = a.app.get(WarehouseFeed).lock!;
 
       // A stalls (its clock stands still) past its lease; B's next campaign takes over.

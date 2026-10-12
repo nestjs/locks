@@ -14,6 +14,11 @@ export interface LockInternals {
   /** When the `acquire()` call that took it was sent, on `clock`. */
   sentAt: number;
   store: LockStore;
+  /**
+   * A call to `store`, bounded by `storeTimeout`: it rejects with `LockStoreTimeoutError` when
+   * the store doesn't answer in time, and an answer that comes after that goes to `late`.
+   */
+  ask<T>(method: 'renew' | 'release', answer: Promise<T>, late?: (answer: T) => void): Promise<T>;
   clock: LockClock;
   /** The lock was lost (not released). */
   onLost(lock: Lock, error: LockLostError): void;
@@ -82,17 +87,15 @@ export class Lock {
       return this.releasing.then(() => false, () => false);
     }
 
-    const { store, key, owner } = this.internals;
-
     if (this.state !== 'held') {
       // A lost lock may still be ours in the store (the deadline passed while it was
       // unreachable): try, but it isn't this caller's problem if that fails.
-      this.releasing = store.release(key, owner).then(() => false, () => false);
+      this.releasing = this.giveBack().then(() => false, () => false);
       return this.releasing;
     }
 
     this.end('released');
-    this.releasing = store.release(key, owner);
+    this.releasing = this.giveBack();
 
     return this.releasing;
   }
@@ -107,8 +110,13 @@ export class Lock {
       return;
     }
     this.end('released');
-    const { store, key, owner } = this.internals;
-    await (ms > 0 ? store.renew(key, owner, ms) : store.release(key, owner));
+    const { store, key, owner, ask } = this.internals;
+    await (ms > 0 ? ask('renew', store.renew(key, owner, ms)) : this.giveBack());
+  }
+
+  private giveBack(): Promise<boolean> {
+    const { store, key, owner, ask } = this.internals;
+    return ask('release', store.release(key, owner));
   }
 
   /**
@@ -153,13 +161,19 @@ export class Lock {
   }
 
   private async renew() {
-    const { store, key, owner, ttl, clock } = this.internals;
+    const { store, key, owner, ttl, clock, ask } = this.internals;
     this.renewing = true;
     const sentAt = clock.now();
     let renewed: boolean;
 
     try {
-      renewed = await store.renew(key, owner, ttl);
+      renewed = await ask('renew', store.renew(key, owner, ttl), (late) => {
+        // Renewed after it timed out, and after this process gave up on the lock: hand it back
+        // (once, however many timed-out renewals land).
+        if (late && this.state === 'lost') {
+          void this.release();
+        }
+      });
     } catch (error) {
       // Keep going: after a transient store error, the next renewal can still land before
       // the deadline.
@@ -174,7 +188,7 @@ export class Lock {
       // Renewed after this process gave up on it (the deadline passed on the way): hand it
       // back rather than block the key until it expires.
       if (renewed && this.state === 'lost') {
-        void store.release(key, owner).catch(() => undefined);
+        void this.giveBack().catch(() => undefined);
       }
       return;
     }

@@ -11,6 +11,15 @@ export interface LocksModuleOptions {
    * `@LeaderElection()`; each takes its own `ttl` too. Default `'30s'`.
    */
   ttl?: Duration;
+  /**
+   * How long to wait for each store call (`acquire()`, `renew()`, `release()`), so a store
+   * that stops answering (a saturated pool, a failover, a client queueing commands offline)
+   * can't hang the callers, scheduled jobs, elections or shutdown with it. A call that runs
+   * out fails with `LockStoreTimeoutError`: `acquire()` and `withLock()` reject, a job doesn't
+   * run, a renewal is tried again at the next beat, and a lock `acquire()` was granted after
+   * that goes back to the store. Default `'10s'`.
+   */
+  storeTimeout?: Duration;
   /** Default: the system clock. Pass a `ManualLockClock` in tests. */
   clock?: LockClock;
   /**
