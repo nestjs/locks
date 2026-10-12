@@ -10,9 +10,14 @@ export interface LockOptions {
   ttl?: Duration;
   /**
    * How long to wait for a lock another holder has, trying again with backoff (and at once
-   * when a holder in this process releases it). Default `0`: try once.
+   * when a holder in this process releases it). Default `0`: try once. A store call already
+   * sent is answered past `wait`: `wait` bounds the waiting for another holder, not the store.
    */
   wait?: Duration;
-  /** Stops waiting: `acquire()` rejects with the signal's reason. */
+  /**
+   * Stops waiting, also for a store call in flight: `acquire()` rejects with the signal's
+   * reason (and a lock the store grants after that goes back to it), and `withLock()` doesn't
+   * run its callback.
+   */
   signal?: AbortSignal;
 }

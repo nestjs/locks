@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, Optional, type BeforeApplicationShutdown } 
 import { randomUUID } from 'node:crypto';
 import type { LockClock } from './interfaces/lock-clock.interface.js';
 import type { LockOptions } from './interfaces/lock-options.interface.js';
+import type { LockAcquireResult } from './interfaces/lock-store.interface.js';
 import type { LocksModuleOptions } from './interfaces/locks-module-options.interface.js';
 import { Lock } from './lock/lock.js';
 import { runInLockScope } from './context/locks.context.js';
@@ -70,19 +71,24 @@ export class Locks implements BeforeApplicationShutdown {
    * Takes the lock on `key`, waiting up to `wait` for another holder to give it back.
    * Resolves the `Lock` (it renews itself until you release it), or `null` if another holder
    * kept it, or the store only granted it after `ttl` (the lease ran out on the way). Rejects
-   * when the store fails, and with `signal`'s reason when it aborts.
+   * when the store fails, and with `signal`'s reason when it aborts, also while the store has
+   * yet to answer (a lock it grants after that goes back to it).
    */
   async acquire(key: string, options: LockOptions = {}): Promise<Lock | null> {
     const { ttl, wait } = this.resolve(key, options);
     const { signal } = options;
     signal?.throwIfAborted();
-    const owner = randomUUID();
     const deadline = this.clock.now() + wait;
     let backoff = FIRST_BACKOFF;
 
     for (;;) {
-      const lock = await this.attempt(key, owner, ttl);
+      const lock = await this.attempt(key, ttl, { signal });
       if (lock) {
+        if (signal?.aborted) {
+          // Aborted between the store's answer and here: the caller has stopped waiting.
+          void lock.release().catch(() => undefined);
+          signal.throwIfAborted();
+        }
         return lock;
       }
       const remaining = deadline - this.clock.now();
@@ -110,6 +116,7 @@ export class Locks implements BeforeApplicationShutdown {
     }
 
     try {
+      options.signal?.throwIfAborted();
       return await runInLockScope({ lock, signal: lock.signal }, () => fn(lock));
     } finally {
       // The work is done, or failed: a release that fails only means the lock expires
@@ -125,7 +132,7 @@ export class Locks implements BeforeApplicationShutdown {
     return {
       clock: this.clock,
       defaultTtl: this.defaultTtl,
-      tryAcquire: (key, ttl, onLost) => this.attempt(key, randomUUID(), ttl, onLost),
+      tryAcquire: (key, ttl, onLost) => this.attempt(key, ttl, { onLost }),
     };
   }
 
@@ -147,15 +154,22 @@ export class Locks implements BeforeApplicationShutdown {
     );
   }
 
+  /**
+   * One call to the store's `acquire()`, with an owner of its own: a call `signal` gave up on
+   * may still be granted later, and must then give back its own lock, never a later attempt's.
+   */
   private async attempt(
     key: string,
-    owner: string,
     ttl: number,
-    onLost?: (lock: Lock, error: LockLostError) => void,
+    { onLost, signal }: { onLost?: (lock: Lock, error: LockLostError) => void; signal?: AbortSignal } = {},
   ): Promise<Lock | null> {
+    signal?.throwIfAborted();
     const store = this.storage.source;
+    const owner = randomUUID();
     const sentAt = this.clock.now();
-    const result = await store.acquire(key, owner, ttl);
+    const result = await this.unlessAborted(store.acquire(key, owner, ttl), signal, () => {
+      void store.release(key, owner).catch(() => undefined);
+    });
     if (!result?.acquired) {
       return null;
     }
@@ -214,6 +228,47 @@ export class Locks implements BeforeApplicationShutdown {
       ttl: options.ttl === undefined ? this.defaultTtl : ttlMs(options.ttl, `Locks: \`ttl\` of "${key}"`),
       wait: options.wait === undefined ? 0 : durationMs(options.wait, `Locks: \`wait\` of "${key}"`),
     };
+  }
+
+  /**
+   * The store's answer, or `signal`'s reason if it aborts first: a store that answers late, or
+   * never (a saturated pool, a failover, a client queueing commands offline), doesn't keep the
+   * caller waiting. A lock granted after that goes back through `giveBack`, and a failure
+   * after that is nobody's to handle.
+   */
+  private unlessAborted(
+    answer: Promise<LockAcquireResult>,
+    signal: AbortSignal | undefined,
+    giveBack: () => void,
+  ): Promise<LockAcquireResult> {
+    if (!signal) {
+      return answer;
+    }
+
+    return new Promise<LockAcquireResult>((resolve, reject) => {
+      const abort = () => {
+        reject(signal.reason);
+        answer.then(
+          (result) => {
+            if (result?.acquired) {
+              giveBack();
+            }
+          },
+          () => undefined,
+        );
+      };
+      signal.addEventListener('abort', abort, { once: true });
+      answer.then(
+        (result) => {
+          signal.removeEventListener('abort', abort);
+          resolve(result);
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', abort);
+          reject(error);
+        },
+      );
+    });
   }
 
   /**
