@@ -21,8 +21,15 @@ export interface LocksInternals {
   clock: LockClock;
   /** The module's `ttl`, in ms. */
   defaultTtl: number;
-  /** One attempt at `key`, with `onLost` called if the lock is lost later. */
-  tryAcquire(key: string, ttl: number, onLost?: (lock: Lock, error: LockLostError) => void): Promise<Lock | null>;
+  /**
+   * One attempt at `key`, with `onLost` called if the lock is lost later. It rejects with
+   * `signal`'s reason when it aborts first (shutdown), and a lock granted after that goes back.
+   */
+  tryAcquire(
+    key: string,
+    ttl: number,
+    options?: { onLost?: (lock: Lock, error: LockLostError) => void; signal?: AbortSignal },
+  ): Promise<Lock | null>;
 }
 
 const FIRST_BACKOFF = 50;
@@ -138,7 +145,7 @@ export class Locks implements BeforeApplicationShutdown {
     return {
       clock: this.clock,
       defaultTtl: this.defaultTtl,
-      tryAcquire: (key, ttl, onLost) => this.attempt(key, ttl, { onLost }),
+      tryAcquire: (key, ttl, options) => this.attempt(key, ttl, options),
     };
   }
 
