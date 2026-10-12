@@ -11,7 +11,8 @@ export interface LockOptions {
   /**
    * How long to wait for a lock another holder has, trying again with backoff (and at once
    * when a holder in this process releases it). Default `0`: try once. A store call already
-   * sent is answered past `wait`: `wait` bounds the waiting for another holder, not the store.
+   * sent is answered past `wait`: `wait` bounds the waiting for another holder, and the
+   * module's `storeTimeout` bounds the store.
    */
   wait?: Duration;
   /**

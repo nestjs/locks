@@ -1,6 +1,9 @@
 /** The default `ttl`, in ms: 30 seconds. */
 export const DEFAULT_TTL = 30_000;
 
+/** The default `storeTimeout`, in ms: 10 seconds. */
+export const DEFAULT_STORE_TIMEOUT = 10_000;
+
 /** Internal: what the scheduler and elections use. */
 export const LOCKS_INTERNALS = Symbol('Locks.internals');
 

@@ -80,6 +80,22 @@ describe('@LeaderElection(): edge cases', () => {
     expect(led).toHaveBeenCalledTimes(1);
   });
 
+  it('campaigns again after a campaign the store never answered timed out', async () => {
+    const led = vi.fn();
+    @Injectable()
+    @LeaderElection('feed', { ttl: '9s' })
+    class Feed {
+      onLeadershipAcquired = led;
+    }
+    vi.spyOn(store, 'acquire').mockReturnValueOnce(new Promise(() => undefined));
+    await instance([Feed]);
+    await clock.advance('10s');
+    expect(logger.matching('ERROR Leader election "feed": the lock store failed')).toHaveLength(1);
+    expect(led).not.toHaveBeenCalled();
+    await clock.advance('3s');
+    expect(led).toHaveBeenCalledTimes(1);
+  });
+
   it('steps down when onLeadershipAcquired() throws synchronously, and leads again at its next campaign', async () => {
     const log: string[] = [];
     let fail = true;

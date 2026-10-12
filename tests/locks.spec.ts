@@ -21,8 +21,8 @@ describe('Locks', () => {
   let logger: CapturingLogger;
 
   /** An instance of the app: its own Locks, on the shared store, with its own clock or the shared one. */
-  async function instance(own?: ManualLockClock) {
-    const app = await startInstance({ store, locks: { clock: own ?? clock }, logger });
+  async function instance(own?: ManualLockClock, storeTimeout?: `${number}s`) {
+    const app = await startInstance({ store, locks: { clock: own ?? clock, storeTimeout }, logger });
     apps.push(app);
     return { app, locks: app.get(Locks), events: collect(app) };
   }
@@ -118,18 +118,22 @@ describe('Locks', () => {
         },
         clearTimeout: (handle) => clock.clearTimeout(handle),
       };
-      const app = await startInstance({ store, locks: { clock: spying }, logger });
+      const app = await startInstance({ store, locks: { clock: spying, storeTimeout: '7s' }, logger });
       apps.push(app);
       const locks = app.get(Locks);
+      const lockTimers = () => timers.filter(({ ms }) => ms !== 7_000);
       const held = (await locks.acquire('k'))!;
-      expect(timers).toEqual([{ ms: 10_000, ref: false }]); // the renewal after ttl / 3
+      expect(lockTimers()).toEqual([{ ms: 10_000, ref: false }]); // the renewal after ttl / 3
       const waiting = locks.acquire('k', { wait: '1s' });
-      await until(() => timers.length === 2);
-      expect(timers[1]).toMatchObject({ ref: true }); // the wait
+      await until(() => lockTimers().length === 2);
+      expect(lockTimers()[1]).toMatchObject({ ref: true }); // the wait
       await held.release();
       const lock = await waiting;
       expect(lock).not.toBeNull();
       await lock!.release();
+      // storeTimeout, around each store call: never what keeps the process up.
+      expect(timers.filter(({ ms }) => ms === 7_000)).toContainEqual({ ms: 7_000, ref: false });
+      expect(timers.filter(({ ms }) => ms === 7_000).every(({ ref }) => !ref)).toBe(true);
     });
 
     it('gives up after wait: null from acquire(), LockNotAcquiredError from withLock()', async () => {
@@ -268,7 +272,7 @@ describe('Locks', () => {
     });
 
     it('aborts at its deadline when no renewal reaches the store, even with one in flight', async () => {
-      const { locks, events } = await instance();
+      const { locks, events } = await instance(undefined, '60s'); // the renewal stays in flight past the deadline
       const lock = (await locks.acquire('k', { ttl: '30s' }))!;
       const stuck = deferred<boolean>();
       const renew = vi.spyOn(store, 'renew').mockReturnValue(stuck.promise);
