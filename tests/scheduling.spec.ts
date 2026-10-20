@@ -58,10 +58,10 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
   let apps: TestingModule[];
   let logger: CapturingLogger;
 
-  async function instance(name: string, own?: ManualLockClock) {
+  async function instance(name: string, own?: ManualLockClock, storeTimeout?: `${number}s`) {
     const app = await startInstance({
       store,
-      locks: { clock: own ?? clock, ttl: '30s' },
+      locks: { clock: own ?? clock, ttl: '30s', storeTimeout },
       providers: [ReportJobs],
       schedule: true,
       logger,
@@ -242,6 +242,56 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     );
     expect(runs).toEqual([]);
     expect(await jobs.nightly()).toBe('done'); // the next tick tries again
+  });
+
+  describe('on a store that never answers', () => {
+    const failed =
+      'ReportJobs.nightly did not run: the lock store failed (InMemoryLockStore.acquire() for the lock "reports:nightly:owner" ' +
+      'did not answer within 10000ms (storeTimeout))';
+
+    it('fails the ticks that waited on it after storeTimeout, and the next tick asks again', async () => {
+      const { jobs } = await instance('a');
+      vi.spyOn(store, 'acquire').mockReturnValueOnce(new Promise(() => undefined));
+      const ticks = [jobs.nightly(), jobs.nightly()].map((tick) => tick.catch((error: Error) => error.message));
+      await clock.advance('10s');
+      expect(await Promise.all(ticks)).toEqual([failed, failed]);
+      expect(runs).toEqual([]);
+      expect(await jobs.nightly()).toBe('done');
+    });
+
+    it('at shutdown, skips the ticks still waiting for it at once, and gives back a lease it grants later', async () => {
+      const { app, jobs } = await instance('a');
+      const answer = deferred();
+      const acquire = store.acquire.bind(store);
+      vi.spyOn(store, 'acquire').mockImplementationOnce(async (key, owner, ttl) => {
+        await answer.promise;
+        return acquire(key, owner, ttl);
+      });
+      const ticks = [jobs.nightly(), jobs.nightly()];
+      apps.splice(apps.indexOf(app), 1);
+      await app.close(); // without moving the clock: nothing waits for storeTimeout
+      expect(await Promise.all(ticks)).toEqual([undefined, undefined]);
+      expect(logger.matching('DEBUG Skipped ReportJobs.nightly: the application is shutting down')).toHaveLength(2);
+      expect(logger.matching('did not run')).toEqual([]);
+
+      const release = vi.spyOn(store, 'release');
+      answer.resolve();
+      await until(() => release.mock.calls.length === 1);
+      expect(store.peek('reports:nightly:owner')).toBeUndefined();
+      expect(runs).toEqual([]);
+    });
+
+    it('at shutdown, skips a tick still waiting for its run lock', async () => {
+      const { app, jobs } = await instance('a');
+      await jobs.reconcile(); // the lease is this instance's: the next tick only asks for the run lock
+      runs = [];
+      vi.spyOn(store, 'acquire').mockReturnValueOnce(new Promise(() => undefined));
+      const tick = jobs.reconcile();
+      apps.splice(apps.indexOf(app), 1);
+      await app.close();
+      expect(await tick).toBeUndefined();
+      expect(runs).toEqual([]);
+    });
   });
 
   it('logs a failed tick through @nestjs/schedule, like any job error', async () => {
@@ -439,7 +489,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
   });
 
   it('skips the ticks that waited on a lease the store granted after its ttl, instead of running them all', async () => {
-    const { jobs } = await instance('a');
+    const { jobs } = await instance('a', undefined, '60s'); // the store answers before storeTimeout
     const acquire = store.acquire.bind(store);
     vi.spyOn(store, 'acquire').mockImplementationOnce(async (key, owner, ttl) => {
       await clock.advance('31s'); // a database failover: the call reaches the store 31s late

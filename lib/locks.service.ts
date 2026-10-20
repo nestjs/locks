@@ -2,16 +2,18 @@ import { Inject, Injectable, Logger, Optional, type BeforeApplicationShutdown } 
 import { randomUUID } from 'node:crypto';
 import type { LockClock } from './interfaces/lock-clock.interface.js';
 import type { LockOptions } from './interfaces/lock-options.interface.js';
-import type { LockAcquireResult } from './interfaces/lock-store.interface.js';
+import type { LockStore } from './interfaces/lock-store.interface.js';
 import type { LocksModuleOptions } from './interfaces/locks-module-options.interface.js';
 import { Lock } from './lock/lock.js';
 import { runInLockScope } from './context/locks.context.js';
 import type { LockLostError } from './errors/lock-lost.error.js';
 import { LockNotAcquiredError } from './errors/lock-not-acquired.error.js';
+import { LockStoreTimeoutError } from './errors/lock-store-timeout.error.js';
 import { LocksEvents } from './events/locks-events.service.js';
-import { DEFAULT_TTL, LOCKS_INTERNALS } from './locks.constants.js';
+import { DEFAULT_STORE_TIMEOUT, DEFAULT_TTL, LOCKS_INTERNALS } from './locks.constants.js';
 import { LOCKS_MODULE_OPTIONS } from './locks.module-definition.js';
 import { LocksStorage, nameOf, storeOptionError } from './storage/locks.storage.js';
+import { storeCall } from './utils/store-call.util.js';
 import { systemClock } from './utils/system-clock.util.js';
 import { durationMs, ttlMs } from './utils/ttl.util.js';
 
@@ -19,8 +21,15 @@ export interface LocksInternals {
   clock: LockClock;
   /** The module's `ttl`, in ms. */
   defaultTtl: number;
-  /** One attempt at `key`, with `onLost` called if the lock is lost later. */
-  tryAcquire(key: string, ttl: number, onLost?: (lock: Lock, error: LockLostError) => void): Promise<Lock | null>;
+  /**
+   * One attempt at `key`, with `onLost` called if the lock is lost later. It rejects with
+   * `signal`'s reason when it aborts first (shutdown), and a lock granted after that goes back.
+   */
+  tryAcquire(
+    key: string,
+    ttl: number,
+    options?: { onLost?: (lock: Lock, error: LockLostError) => void; signal?: AbortSignal },
+  ): Promise<Lock | null>;
 }
 
 const FIRST_BACKOFF = 50;
@@ -46,6 +55,7 @@ export class Locks implements BeforeApplicationShutdown {
   private readonly logger = new Logger('Locks');
   private readonly clock: LockClock;
   private readonly defaultTtl: number;
+  private readonly storeTimeout: number;
   private readonly held = new Set<Lock>();
   private readonly waiters = new Map<string, Set<() => void>>();
 
@@ -65,14 +75,17 @@ export class Locks implements BeforeApplicationShutdown {
     }
 
     this.defaultTtl = options?.ttl === undefined ? DEFAULT_TTL : ttlMs(options.ttl, 'LocksModule: `ttl`');
+    this.storeTimeout =
+      options?.storeTimeout === undefined ? DEFAULT_STORE_TIMEOUT : ttlMs(options.storeTimeout, 'LocksModule: `storeTimeout`');
   }
 
   /**
    * Takes the lock on `key`, waiting up to `wait` for another holder to give it back.
    * Resolves the `Lock` (it renews itself until you release it), or `null` if another holder
    * kept it, or the store only granted it after `ttl` (the lease ran out on the way). Rejects
-   * when the store fails, and with `signal`'s reason when it aborts, also while the store has
-   * yet to answer (a lock it grants after that goes back to it).
+   * when the store fails or doesn't answer within `storeTimeout` (`LockStoreTimeoutError`), and
+   * with `signal`'s reason when it aborts, also while the store has yet to answer (a lock it
+   * grants after that goes back to it).
    */
   async acquire(key: string, options: LockOptions = {}): Promise<Lock | null> {
     const { ttl, wait } = this.resolve(key, options);
@@ -132,7 +145,7 @@ export class Locks implements BeforeApplicationShutdown {
     return {
       clock: this.clock,
       defaultTtl: this.defaultTtl,
-      tryAcquire: (key, ttl, onLost) => this.attempt(key, ttl, { onLost }),
+      tryAcquire: (key, ttl, options) => this.attempt(key, ttl, options),
     };
   }
 
@@ -166,9 +179,17 @@ export class Locks implements BeforeApplicationShutdown {
     signal?.throwIfAborted();
     const store = this.storage.source;
     const owner = randomUUID();
+    const ask = <T>(method: keyof LockStore, answer: Promise<T>, late?: (answer: T) => void) =>
+      this.ask(store, method, key, answer, { late });
+    const giveBack = () => ask('release', store.release(key, owner)).catch(() => undefined);
     const sentAt = this.clock.now();
-    const result = await this.unlessAborted(store.acquire(key, owner, ttl), signal, () => {
-      void store.release(key, owner).catch(() => undefined);
+    const result = await this.ask(store, 'acquire', key, store.acquire(key, owner, ttl), {
+      signal,
+      late: (answer) => {
+        if (answer?.acquired) {
+          void giveBack();
+        }
+      },
     });
     if (!result?.acquired) {
       return null;
@@ -178,7 +199,7 @@ export class Locks implements BeforeApplicationShutdown {
 
     if (!Number.isSafeInteger(fencingToken) || fencingToken < 1) {
       // A store bug that would silently break fencing: give the lock back, and say what to fix.
-      await store.release(key, owner).catch(() => undefined);
+      await giveBack();
       throw new TypeError(
         `${nameOf(store)}.acquire() must resolve fencingToken as a positive safe integer, got ${JSON.stringify(fencingToken)} ` +
           `(${typeof fencingToken})${typeof fencingToken === 'string' ? ': PostgreSQL returns bigint columns as strings, convert it with Number()' : ''}`,
@@ -190,7 +211,7 @@ export class Locks implements BeforeApplicationShutdown {
     // have handed on. Give it back, so the key isn't blocked for a ttl, and report it as taken.
     const elapsed = this.clock.now() - sentAt;
     if (elapsed >= ttl) {
-      await store.release(key, owner).catch(() => undefined);
+      await giveBack();
       this.logger.warn(`The store granted the lock "${key}" ${elapsed}ms after acquire() was sent, past its ${ttl}ms ttl: gave it back.`);
       return null;
     }
@@ -202,6 +223,7 @@ export class Locks implements BeforeApplicationShutdown {
       ttl,
       sentAt,
       store,
+      ask,
       clock: this.clock,
       onLost: (lost, error) => {
         this.logger.warn(`${error.message}. Stop writing on its behalf, and fence what it guards with its token.`);
@@ -230,44 +252,19 @@ export class Locks implements BeforeApplicationShutdown {
     };
   }
 
-  /**
-   * The store's answer, or `signal`'s reason if it aborts first: a store that answers late, or
-   * never (a saturated pool, a failover, a client queueing commands offline), doesn't keep the
-   * caller waiting. A lock granted after that goes back through `giveBack`, and a failure
-   * after that is nobody's to handle.
-   */
-  private unlessAborted(
-    answer: Promise<LockAcquireResult>,
-    signal: AbortSignal | undefined,
-    giveBack: () => void,
-  ): Promise<LockAcquireResult> {
-    if (!signal) {
-      return answer;
-    }
-
-    return new Promise<LockAcquireResult>((resolve, reject) => {
-      const abort = () => {
-        reject(signal.reason);
-        answer.then(
-          (result) => {
-            if (result?.acquired) {
-              giveBack();
-            }
-          },
-          () => undefined,
-        );
-      };
-      signal.addEventListener('abort', abort, { once: true });
-      answer.then(
-        (result) => {
-          signal.removeEventListener('abort', abort);
-          resolve(result);
-        },
-        (error: unknown) => {
-          signal.removeEventListener('abort', abort);
-          reject(error);
-        },
-      );
+  /** A call to `store`, bounded by `storeTimeout` (and `signal`, if any). */
+  private ask<T>(
+    store: LockStore,
+    method: keyof LockStore,
+    key: string,
+    answer: Promise<T>,
+    options: { signal?: AbortSignal; late?: (answer: T) => void } = {},
+  ): Promise<T> {
+    return storeCall(answer, {
+      ...options,
+      clock: this.clock,
+      timeout: this.storeTimeout,
+      timedOut: () => new LockStoreTimeoutError(key, method, this.storeTimeout, nameOf(store)),
     });
   }
 

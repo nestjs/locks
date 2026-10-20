@@ -21,6 +21,8 @@ class Election {
   private timer: unknown;
   private campaigning = false;
   private stopped = false;
+  /** Aborts at `stop()`: a campaign still waiting for the store stops waiting. */
+  private readonly stopping = new AbortController();
 
   constructor(
     readonly key: string,
@@ -37,6 +39,7 @@ class Election {
 
   async stop() {
     this.stopped = true;
+    this.stopping.abort(new DOMException('The application is shutting down', 'AbortError'));
     if (this.timer !== undefined) {
       this.locks.clock.clearTimeout(this.timer);
     }
@@ -56,8 +59,11 @@ class Election {
     let lock: Lock | null = null;
 
     try {
-      lock = await this.locks.tryAcquire(this.key, this.ttl, (lost) => this.lost(lost));
+      lock = await this.locks.tryAcquire(this.key, this.ttl, { onLost: (lost) => this.lost(lost), signal: this.stopping.signal });
     } catch (error) {
+      if (this.stopped) {
+        return; // the campaign stopped waiting at shutdown, or failed after it: nothing to report
+      }
       this.logger.error(`Leader election "${this.key}": the lock store failed`, (error as Error)?.stack ?? String(error));
     } finally {
       this.campaigning = false;

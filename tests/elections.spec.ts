@@ -6,7 +6,7 @@ import type { LockAcquireResult } from '../lib/interfaces/lock-store.interface.j
 import type { Lock } from '../lib/lock/lock.js';
 import { InMemoryLockStore } from '../lib/stores/in-memory-lock.store.js';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
-import { CapturingLogger, deferred, startInstance } from './helpers.js';
+import { CapturingLogger, deferred, startInstance, until } from './helpers.js';
 
 describe('@LeaderElection(): edge cases', () => {
   let clock: ManualLockClock;
@@ -78,6 +78,49 @@ describe('@LeaderElection(): edge cases', () => {
     expect(led).not.toHaveBeenCalled();
     await clock.advance('3s');
     expect(led).toHaveBeenCalledTimes(1);
+  });
+
+  it('campaigns again after a campaign the store never answered timed out', async () => {
+    const led = vi.fn();
+    @Injectable()
+    @LeaderElection('feed', { ttl: '9s' })
+    class Feed {
+      onLeadershipAcquired = led;
+    }
+    vi.spyOn(store, 'acquire').mockReturnValueOnce(new Promise(() => undefined));
+    await instance([Feed]);
+    await clock.advance('10s');
+    expect(logger.matching('ERROR Leader election "feed": the lock store failed')).toHaveLength(1);
+    expect(led).not.toHaveBeenCalled();
+    await clock.advance('3s');
+    expect(led).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a campaign still waiting for the store at shutdown, without logging it, and gives back a lease it grants later', async () => {
+    const led = vi.fn();
+    @Injectable()
+    @LeaderElection('feed', { ttl: '9s' })
+    class Feed {
+      onLeadershipAcquired = led;
+    }
+    const answer = deferred();
+    const acquire = store.acquire.bind(store);
+    vi.spyOn(store, 'acquire').mockImplementationOnce(async (key, owner, ttl) => {
+      await answer.promise;
+      return acquire(key, owner, ttl);
+    });
+    const app = await instance([Feed]);
+    await clock.advance(0);
+    apps = [];
+    await app.close(); // without moving the clock: nothing waits for storeTimeout
+    await clock.advance('10s'); // nor times out after shutdown, to be logged as a store failure
+
+    const release = vi.spyOn(store, 'release');
+    answer.resolve();
+    await until(() => release.mock.calls.length === 1);
+    expect(store.peek('feed')).toBeUndefined();
+    expect(led).not.toHaveBeenCalled();
+    expect(logger.matching('ERROR')).toEqual([]);
   });
 
   it('steps down when onLeadershipAcquired() throws synchronously, and leads again at its next campaign', async () => {
