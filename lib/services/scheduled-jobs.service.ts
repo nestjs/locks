@@ -83,8 +83,11 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit() {
-    /** Which job each key came from: two different jobs may share a key only if both set it. */
-    const owners = new Map<string, JobDefinition>();
+    /**
+     * Which job each key came from: two different jobs (another method, or the same one on
+     * another instance) may share a key only if both set it.
+     */
+    const owners = new Map<string, { instance: object; definition: JobDefinition; job: string }>();
     /** The jobs on each key, for the collision check against the other keys and the elections. */
     const jobs = new Map<string, string[]>();
 
@@ -98,27 +101,33 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
         if (!definition) {
           continue;
         }
+        // Named after the instance's class, not the one declaring the method: each subclass
+        // that inherits a decorated method is a job of its own.
+        const job = describeJob(definition, instance);
         if (!wrapper.isDependencyTreeStatic()) {
           this.logger.warn(
-            `${describeJob(definition)} is decorated with ${decoratorsOf(definition)}, but ${wrapper.name as string} is ` +
+            `${job} is decorated with ${decoratorsOf(definition)}, but ${wrapper.name as string} is ` +
               'not a singleton provider (it is request-scoped or transient, or depends on one), so its calls will fail.',
           );
           continue;
         }
-        const key = definition.key ?? definition.derivedKey;
+        const key = definition.key ?? job;
         const previous = owners.get(key);
-        if (previous && previous !== definition && (previous.key === undefined || definition.key === undefined)) {
+        if (previous && previous.instance === instance && previous.definition === definition) {
+          continue; // the same provider under another token (`useExisting`)
+        }
+        if (previous && (previous.definition.key === undefined || definition.key === undefined)) {
           throw new Error(
-            `LocksModule: ${describeJob(previous)} and ${describeJob(definition)} both use the lock key "${key}". ` +
+            `LocksModule: ${previous.job} and ${job} both use the lock key "${key}". ` +
               'Two jobs share a key only when both set it on purpose (to exclude each other); set `key` on ' +
-              `${decoratorsOf(definition.key === undefined ? definition : previous)} to tell them apart.`,
+              `${decoratorsOf(definition.key === undefined ? definition : previous.definition)} to tell them apart.`,
           );
         }
-        owners.set(key, definition);
-        if (!jobs.get(key)?.includes(describeJob(definition))) {
-          jobs.set(key, [...(jobs.get(key) ?? []), describeJob(definition)]);
+        owners.set(key, { instance, definition, job });
+        if (!jobs.get(key)?.includes(job)) {
+          jobs.set(key, [...(jobs.get(key) ?? []), job]);
         }
-        this.register(instance, definition, key);
+        this.register(instance, definition, key, job);
       }
     }
     // A job holds `key` (its run lock) and `key:owner` (its lease): neither may be another
@@ -154,13 +163,13 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  private register(instance: object, definition: JobDefinition, key: string) {
+  private register(instance: object, definition: JobDefinition, key: string, job: string) {
     const internals = this.locks[LOCKS_INTERNALS];
     let state = this.states.get(key);
     if (!state) {
       this.states.set(key, (state = new KeyState(key, internals, this.logger)));
     }
-    const runner = this.runner(definition, state, internals);
+    const runner = this.runner(definition, job, state, internals);
     let runners = jobRunners.get(instance);
     if (!runners) {
       jobRunners.set(instance, (runners = new Map()));
@@ -168,8 +177,7 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
     runners.set(definition, runner);
   }
 
-  private runner(definition: JobDefinition, state: KeyState, internals: LocksInternals): JobRunner {
-    const job = describeJob(definition);
+  private runner(definition: JobDefinition, job: string, state: KeyState, internals: LocksInternals): JobRunner {
     const skip = (why: string) => {
       this.logger.debug(`Skipped ${job}: ${why}`);
       return undefined;

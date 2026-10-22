@@ -1,6 +1,6 @@
 import { JOB_DEFINITION } from '../locks.constants.js';
 import type { OnOneInstanceOptions, WithoutOverlappingOptions } from '../interfaces/job-options.interface.js';
-import { decoratorsOf, describeJob, jobRunners, type JobDefinition } from './job-registry.util.js';
+import { decoratorsOf, describeJob, jobClassName, jobRunners, type JobDefinition } from './job-registry.util.js';
 import { ttlMs } from './ttl.util.js';
 
 type Kind = 'oneInstance' | 'withoutOverlapping';
@@ -64,15 +64,14 @@ function wrap(method: (...args: unknown[]) => unknown, target: object, propertyK
   const definition: JobDefinition = {
     className: target.constructor.name,
     methodName: String(propertyKey),
-    derivedKey: `${target.constructor.name}.${String(propertyKey)}`,
   };
   const wrapper: Wrapped = async function (this: object, ...args: unknown[]) {
     const runner = jobRunners.get(this)?.get(definition);
     if (!runner) {
       throw new Error(
-        `${describeJob(definition)} is decorated with ${decoratorsOf(definition)}, but LocksModule doesn't know this ` +
-          `instance, so it can't tell whether this call may run. Import LocksModule in the application, and provide ` +
-          `${definition.className} as a singleton provider (not request-scoped or transient, not created with \`new\`).`,
+        `${describeJob(definition, this)} is decorated with ${decoratorsOf(definition)}, but LocksModule doesn't know ` +
+          `this instance, so it can't tell whether this call may run. Import LocksModule in the application, and provide ` +
+          `${jobClassName(definition, this)} as a singleton provider (not request-scoped or transient, not created with \`new\`).`,
       );
     }
 

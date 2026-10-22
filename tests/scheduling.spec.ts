@@ -403,6 +403,52 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       await exporting;
     });
 
+    it('gives each subclass that inherits a decorated method a key of its own', async () => {
+      abstract class ReportJob {
+        @OnOneInstance()
+        @WithoutOverlapping()
+        async run() {
+          runs.push({ job: this.constructor.name, instance: 'a' });
+          await gate;
+        }
+      }
+      @Injectable()
+      class SalesReport extends ReportJob {}
+      @Injectable()
+      class StockReport extends ReportJob {}
+      const app = await startInstance({ providers: [SalesReport, StockReport], store, locks: { clock }, logger });
+      apps.push(app);
+      const hold = deferred();
+      gate = hold.promise;
+      const sales = app.get(SalesReport).run();
+      const stock = app.get(StockReport).run();
+      await until(() => runs.length === 2); // neither excludes the other
+      expect(await app.get(SalesReport).run()).toBeUndefined(); // but each still excludes itself
+      expect(logger.matching('DEBUG Skipped SalesReport.run: a run is still in progress')).toHaveLength(1);
+      hold.resolve();
+      await Promise.all([sales, stock]);
+      expect(runs.map((r) => r.job).sort()).toEqual(['SalesReport', 'StockReport']);
+      expect(logger.matching(/runs on this instance \(lease "(Sales|Stock)Report\.run:owner"/)).toHaveLength(2);
+    });
+
+    it('refuses one job class provided twice under its default key, but not an alias of the same instance', async () => {
+      @Injectable()
+      class Sync {
+        @WithoutOverlapping()
+        run() {}
+      }
+      const twice = await Test.createTestingModule({
+        imports: [LocksModule.forRoot()],
+        providers: [Sync, { provide: 'second', useClass: Sync }],
+      }).compile();
+      twice.useLogger(false);
+      await expect(twice.init()).rejects.toThrow('LocksModule: Sync.run and Sync.run both use the lock key "Sync.run".');
+
+      const app = await startInstance({ providers: [Sync, { provide: 'alias', useExisting: Sync }], store, locks: { clock }, logger });
+      apps.push(app);
+      expect(app.get('alias')).toBe(app.get(Sync));
+    });
+
     it("refuses a job whose key is another job's lease (`<key>:owner`)", async () => {
       @Injectable()
       class Nightly {
