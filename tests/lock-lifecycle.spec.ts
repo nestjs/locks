@@ -436,6 +436,67 @@ describe('Locks: edge cases', () => {
       expect(logger.matching('ERROR Could not release the lock "stuck" at shutdown')).toHaveLength(1);
     });
 
+    it("doesn't hand a released lock to a caller waiting for it, which would renew after the store closed", async () => {
+      const { app, locks } = await instance();
+      await locks.acquire('k');
+      const waiting = locks.acquire('k', { wait: '1m' });
+      await clock.advance(0);
+      const acquire = vi.spyOn(store, 'acquire');
+      const renew = vi.spyOn(store, 'renew');
+      apps = [];
+      await app.close();
+
+      expect(await waiting).toBeNull();
+      expect(acquire).not.toHaveBeenCalled();
+      expect(clock.pendingTimers).toBe(0);
+      await clock.advance('1m');
+      expect(renew).not.toHaveBeenCalled();
+      expect(await store.acquire('k', 'next', 1_000)).toMatchObject({ acquired: true });
+    });
+
+    it('stops a wait for a key another instance holds at once', async () => {
+      const other = await instance();
+      const { app, locks } = await instance();
+      await other.locks.acquire('k');
+      const waiting = locks.acquire('k', { wait: '1m' });
+      await clock.advance(0);
+      const acquire = vi.spyOn(store, 'acquire');
+      apps.splice(apps.indexOf(app), 1);
+      await app.close();
+
+      expect(await waiting).toBeNull();
+      expect(acquire).not.toHaveBeenCalled();
+    });
+
+    it('gives back a lock the store grants after the shutdown began, and grants none after', async () => {
+      const { app, locks } = await instance();
+      const answer = deferred();
+      const grant = store.acquire.bind(store);
+      vi.spyOn(store, 'acquire').mockImplementationOnce(async (key, owner, ttl) => {
+        await answer.promise;
+        return grant(key, owner, ttl);
+      });
+      const acquiring = locks.acquire('k');
+      await clock.advance(0);
+      apps = [];
+      const closing = app.close();
+      await clock.advance(0);
+      const release = vi.spyOn(store, 'release');
+      answer.resolve();
+      expect(await acquiring).toBeNull();
+      await closing;
+      expect(release.mock.calls.map(([key]) => key)).toEqual(['k']);
+      expect(clock.pendingTimers).toBe(0);
+
+      await expect(locks.acquire('k')).resolves.toBeNull();
+      await expect(locks.withLock('k', () => 'ran', { wait: '1m' })).rejects.toMatchObject({
+        name: 'LockNotAcquiredError',
+        reason: 'shutdown',
+        message: 'Could not acquire the lock "k": the application is shutting down',
+      });
+      expect(store.acquire).toHaveBeenCalledTimes(1);
+    });
+
     it('completes LocksEvents.events$', async () => {
       const { app } = await instance();
       const complete = vi.fn();
