@@ -153,7 +153,7 @@ describe('Locks', () => {
       await rejected;
       const error = await withLock.catch((e: unknown) => e);
       expect(error).toBeInstanceOf(LocksError);
-      expect(error).toMatchObject({ name: 'LockNotAcquiredError', key: 'k', waitMs: 2_000 });
+      expect(error).toMatchObject({ name: 'LockNotAcquiredError', key: 'k', waitMs: 2_000, reason: 'taken' });
       expect((error as Error).message).toBe('Could not acquire the lock "k" within 2000ms: another holder has it');
       expect(run).not.toHaveBeenCalled();
     });

@@ -24,6 +24,8 @@ export interface LocksInternals {
   /**
    * One attempt at `key`, with `onLost` called if the lock is lost later. It rejects with
    * `signal`'s reason when it aborts first (shutdown), and a lock granted after that goes back.
+   * Once `beforeApplicationShutdown()` has begun, it resolves `null` without calling the store,
+   * and a grant that lands after that goes back too.
    */
   tryAcquire(
     key: string,
@@ -58,6 +60,8 @@ export class Locks implements BeforeApplicationShutdown {
   private readonly storeTimeout: number;
   private readonly held = new Set<Lock>();
   private readonly waiters = new Map<string, Set<() => void>>();
+  /** Set when `beforeApplicationShutdown()` begins: from then on, the store grants no new locks. */
+  private closing = false;
 
   constructor(
     private readonly storage: LocksStorage,
@@ -82,7 +86,8 @@ export class Locks implements BeforeApplicationShutdown {
   /**
    * Takes the lock on `key`, waiting up to `wait` for another holder to give it back.
    * Resolves the `Lock` (it renews itself until you release it), or `null` if another holder
-   * kept it, or the store only granted it after `ttl` (the lease ran out on the way). Rejects
+   * kept it, the store only granted it after `ttl` (the lease ran out on the way), or the
+   * application is shutting down (a lock the store grants after that goes back to it). Rejects
    * when the store fails or doesn't answer within `storeTimeout` (`LockStoreTimeoutError`), and
    * with `signal`'s reason when it aborts, also while the store has yet to answer (a lock it
    * grants after that goes back to it).
@@ -102,10 +107,14 @@ export class Locks implements BeforeApplicationShutdown {
           void lock.release().catch(() => undefined);
           signal.throwIfAborted();
         }
+        if (this.closing) {
+          // The shutdown began between the store's answer and here, and released it with the rest.
+          return null;
+        }
         return lock;
       }
       const remaining = deadline - this.clock.now();
-      if (remaining <= 0) {
+      if (remaining <= 0 || this.closing) {
         return null;
       }
       signal?.throwIfAborted();
@@ -118,14 +127,15 @@ export class Locks implements BeforeApplicationShutdown {
   /**
    * Runs `fn` under the lock on `key`, then releases it, whether `fn` resolves or throws.
    * Rejects with `LockNotAcquiredError` if another holder kept the lock for `wait` (default:
-   * don't wait). Inside `fn`, `LocksContext` has the lock too. If the lock is lost while `fn`
-   * runs, `lock.signal` aborts with a `LockLostError`; `fn` decides whether to stop.
+   * don't wait), or the application is shutting down (its `reason` says which). Inside `fn`,
+   * `LocksContext` has the lock too. If the lock is lost while `fn` runs, `lock.signal` aborts
+   * with a `LockLostError`; `fn` decides whether to stop.
    */
   async withLock<T>(key: string, fn: (lock: Lock) => T | Promise<T>, options: LockOptions = {}): Promise<T> {
     const { wait } = this.resolve(key, options);
     const lock = await this.acquire(key, options);
     if (!lock) {
-      throw new LockNotAcquiredError(key, wait);
+      throw new LockNotAcquiredError(key, wait, this.closing ? 'shutdown' : 'taken');
     }
 
     try {
@@ -155,9 +165,20 @@ export class Locks implements BeforeApplicationShutdown {
    * jobs finish and elections step down), and before any `onApplicationShutdown`, where
    * the app closes the store's connection. Nest runs each phase for the whole application,
    * and inside a phase a module imported before `LocksModule` runs first, so a release in
-   * `onApplicationShutdown` could find the pool already ended.
+   * `onApplicationShutdown` could find the pool already ended. From here on, the store grants
+   * no new locks: `acquire()` resolves `null` without a store call, a caller waiting for a key
+   * stops waiting, and a grant that lands after that goes back to the store.
    */
   async beforeApplicationShutdown() {
+    // Before the releases below wake the callers waiting for these keys: a lock granted from
+    // here on would miss the snapshot, and renew after onApplicationShutdown() closed the store.
+    this.closing = true;
+    // A wake removes itself from its set, and an empty set from the map: safe mid-iteration.
+    for (const waiters of this.waiters.values()) {
+      for (const wake of waiters) {
+        wake();
+      }
+    }
     await Promise.all(
       [...this.held].map((lock) =>
         lock.release().catch((error: unknown) => {
@@ -177,6 +198,9 @@ export class Locks implements BeforeApplicationShutdown {
     { onLost, signal }: { onLost?: (lock: Lock, error: LockLostError) => void; signal?: AbortSignal } = {},
   ): Promise<Lock | null> {
     signal?.throwIfAborted();
+    if (this.closing) {
+      return null;
+    }
     const store = this.storage.source;
     const owner = randomUUID();
     const ask = <T>(method: keyof LockStore, answer: Promise<T>, late?: (answer: T) => void) =>
@@ -192,6 +216,11 @@ export class Locks implements BeforeApplicationShutdown {
       },
     });
     if (!result?.acquired) {
+      return null;
+    }
+    if (this.closing) {
+      // Granted after the shutdown began: nothing would release it, so give it back now.
+      await giveBack();
       return null;
     }
 
