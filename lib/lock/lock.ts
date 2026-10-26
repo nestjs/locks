@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import type { Logger } from '@nestjs/common';
 import { LockLostError } from '../errors/lock-lost.error.js';
 import type { LockClock } from '../interfaces/lock-clock.interface.js';
 import type { LockStore } from '../interfaces/lock-store.interface.js';
@@ -20,6 +20,7 @@ export interface LockInternals {
    */
   ask<T>(method: 'renew' | 'release', answer: Promise<T>, late?: (answer: T) => void): Promise<T>;
   clock: LockClock;
+  logger: Logger;
   /** The lock was lost (not released). */
   onLost(lock: Lock, error: LockLostError): void;
   /** The lock was released or lost: it is no longer held. */
@@ -27,8 +28,6 @@ export interface LockInternals {
 }
 
 type State = 'held' | 'released' | 'lost';
-
-const logger = new Logger('Locks');
 
 /**
  * A lock this process holds, from `Locks.acquire()`, `withLock()`, a scheduled job
@@ -161,7 +160,7 @@ export class Lock {
   }
 
   private async renew() {
-    const { store, key, owner, ttl, clock, ask } = this.internals;
+    const { store, key, owner, ttl, clock, ask, logger } = this.internals;
     this.renewing = true;
     const sentAt = clock.now();
     let renewed: boolean;

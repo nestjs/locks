@@ -12,9 +12,9 @@ import { LocksStorage, storeOptionError } from './storage/locks.storage.js';
 import { ScheduledJobs } from './services/scheduled-jobs.service.js';
 
 /**
- * `LocksModule.forRoot({ ttl, clock, allowInMemoryStorage })`, or `forRootAsync({ imports,
- * inject, useFactory | useClass | useExisting })`, where the factory returns the options.
- * Global by default.
+ * `LocksModule.forRoot({ ttl, clock, allowInMemoryStorage, logger })`, or `forRootAsync({
+ * imports, inject, useFactory | useClass | useExisting })`, where the factory returns the
+ * options. Global by default.
  *
  * Provides `Locks` (acquire, withLock), `LocksContext`, `LocksEvents` and `LocksStorage`,
  * where the app's store registers itself (without one, locks live in memory). It also runs

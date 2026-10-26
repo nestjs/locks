@@ -1,4 +1,4 @@
-import type { ConfigurableModuleAsyncOptions } from '@nestjs/common';
+import type { ConfigurableModuleAsyncOptions, LogLevel } from '@nestjs/common';
 import type { Duration } from './duration.interface.js';
 import type { LockClock } from './lock-clock.interface.js';
 
@@ -27,6 +27,14 @@ export interface LocksModuleOptions {
    * lock only excludes callers in this process. `true` accepts that (one instance).
    */
   allowInMemoryStorage?: boolean;
+  /**
+   * Which Nest log levels this package emits. Same shape as `NestFactory.create({ logger })`:
+   * `false` silences every message; an array keeps those levels and every more severe one
+   * (so `['warn']` keeps warn, error and fatal; `['error', 'warn']` drops ownership and
+   * skipped-tick lines in production). The application logger still applies on top. Default:
+   * every level the application enables.
+   */
+  logger?: false | LogLevel[];
 }
 
 /** Structural options: the top level of `forRoot()` and `forRootAsync()`. */

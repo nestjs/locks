@@ -1,6 +1,8 @@
 import {
+  Inject,
   Injectable,
   Logger,
+  Optional,
   type OnApplicationBootstrap,
   type OnModuleDestroy,
   type OnModuleInit,
@@ -10,8 +12,11 @@ import { LockKeys } from './lock-keys.service.js';
 import type { Lock } from '../lock/lock.js';
 import { LocksEvents } from '../events/locks-events.service.js';
 import type { LeaderElectionDefinition } from '../interfaces/leader-election.interface.js';
+import type { LocksModuleOptions } from '../interfaces/locks-module-options.interface.js';
 import { LEADER_ELECTION, LOCKS_INTERNALS } from '../locks.constants.js';
+import { LOCKS_MODULE_OPTIONS } from '../locks.module-definition.js';
 import { Locks, type LocksInternals } from '../locks.service.js';
+import { locksLogger } from '../utils/locks-logger.util.js';
 
 type Participant = Partial<Record<'onLeadershipAcquired' | 'onLeadershipLost', (lock: Lock) => unknown>> & object;
 
@@ -163,7 +168,7 @@ class Election {
  */
 @Injectable()
 export class LeaderElections implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
-  private readonly logger = new Logger('Locks');
+  private readonly logger: Logger;
   private readonly elections = new Map<string, Election>();
 
   constructor(
@@ -171,7 +176,10 @@ export class LeaderElections implements OnModuleInit, OnApplicationBootstrap, On
     private readonly locks: Locks,
     private readonly events: LocksEvents,
     private readonly keys: LockKeys,
-  ) {}
+    @Optional() @Inject(LOCKS_MODULE_OPTIONS) options?: LocksModuleOptions,
+  ) {
+    this.logger = locksLogger('Locks', options?.logger);
+  }
 
   onModuleInit() {
     const internals = this.locks[LOCKS_INTERNALS];

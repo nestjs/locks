@@ -115,6 +115,15 @@ describe('LocksModule options', () => {
     await moduleRef.close();
     await expect(compile([LocksModule.forRootAsync({ useFactory: async () => ({}) })])).rejects.toThrow('no LockStore is registered');
   });
+
+  it('refuses a bad logger option, naming what it got', async () => {
+    await expect(compile([LocksModule.forRoot({ logger: 'quiet' as never })])).rejects.toThrow(
+      'LocksModule: `logger` must be false or an array of log levels (verbose, debug, log, warn, error, fatal), got "quiet"',
+    );
+    await expect(compile([LocksModule.forRoot({ logger: ['error', 'noise'] as never })])).rejects.toThrow(
+      'LocksModule: `logger` has unknown level "noise"; use verbose, debug, log, warn, error, fatal',
+    );
+  });
 });
 
 describe('LocksStorage: messages', () => {

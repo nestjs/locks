@@ -13,6 +13,7 @@ import { LocksEvents } from './events/locks-events.service.js';
 import { DEFAULT_STORE_TIMEOUT, DEFAULT_TTL, LOCKS_INTERNALS } from './locks.constants.js';
 import { LOCKS_MODULE_OPTIONS } from './locks.module-definition.js';
 import { LocksStorage, nameOf, storeOptionError } from './storage/locks.storage.js';
+import { locksLogger } from './utils/locks-logger.util.js';
 import { storeCall } from './utils/store-call.util.js';
 import { systemClock } from './utils/system-clock.util.js';
 import { durationMs, ttlMs } from './utils/ttl.util.js';
@@ -54,7 +55,7 @@ const MAX_BACKOFF = 1_000;
  */
 @Injectable()
 export class Locks implements BeforeApplicationShutdown {
-  private readonly logger = new Logger('Locks');
+  private readonly logger: Logger;
   private readonly clock: LockClock;
   private readonly defaultTtl: number;
   private readonly storeTimeout: number;
@@ -73,6 +74,7 @@ export class Locks implements BeforeApplicationShutdown {
       throw storeOptionError();
     }
 
+    this.logger = locksLogger('Locks', options?.logger);
     this.clock = options?.clock ?? systemClock;
     if (typeof this.clock?.now !== 'function' || typeof this.clock.setTimeout !== 'function' || typeof this.clock.clearTimeout !== 'function') {
       throw new TypeError(`LocksModule: \`clock\` must implement LockClock (now, setTimeout, clearTimeout), got ${nameOf(this.clock)}`);
@@ -254,6 +256,7 @@ export class Locks implements BeforeApplicationShutdown {
       store,
       ask,
       clock: this.clock,
+      logger: this.logger,
       onLost: (lost, error) => {
         this.logger.warn(`${error.message}. Stop writing on its behalf, and fence what it guards with its token.`);
         this.events.emit({ type: 'lock-lost', key, fencingToken, detectedBy: error.detectedBy });

@@ -1,11 +1,14 @@
-import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { LockKeys } from './lock-keys.service.js';
 import type { Lock } from '../lock/lock.js';
+import type { LocksModuleOptions } from '../interfaces/locks-module-options.interface.js';
 import { JOB_DEFINITION, LINGER, LOCKS_INTERNALS } from '../locks.constants.js';
+import { LOCKS_MODULE_OPTIONS } from '../locks.module-definition.js';
 import { runInLockScope } from '../context/locks.context.js';
 import { Locks, type LocksInternals } from '../locks.service.js';
 import { decoratorsOf, describeJob, jobRunners, type JobDefinition, type JobRunner } from '../utils/job-registry.util.js';
+import { locksLogger } from '../utils/locks-logger.util.js';
 
 /**
  * On shutdown, a job that started less than this long ago keeps its lease for the rest of
@@ -68,7 +71,7 @@ class KeyState {
  */
 @Injectable()
 export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger('Locks');
+  private readonly logger: Logger;
   private readonly states = new Map<string, KeyState>();
   private readonly pending = new Set<Promise<unknown>>();
   /** Aborts at shutdown: a tick still waiting for its locks stops waiting for the store. */
@@ -80,7 +83,10 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
     private readonly scanner: MetadataScanner,
     private readonly locks: Locks,
     private readonly keys: LockKeys,
-  ) {}
+    @Optional() @Inject(LOCKS_MODULE_OPTIONS) options?: LocksModuleOptions,
+  ) {
+    this.logger = locksLogger('Locks', options?.logger);
+  }
 
   onModuleInit() {
     /**

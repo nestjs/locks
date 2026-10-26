@@ -119,6 +119,36 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(logger.matching('DEBUG Skipped ReportJobs.nightly: it runs on another instance')).toHaveLength(6);
   });
 
+  it('keeps only the configured Nest log levels from this package', async () => {
+    async function withLogger(option: false | ('error' | 'warn')[], capture: CapturingLogger) {
+      const own = new InMemoryLockStore({ clock });
+      const jobs = await Promise.all(
+        ['a', 'b'].map(async (name) => {
+          const app = await startInstance({
+            store: own,
+            locks: { clock, ttl: '30s', logger: option },
+            providers: [ReportJobs],
+            logger: capture,
+          });
+          app.get(ReportJobs).instance = name;
+          apps.push(app);
+          return app.get(ReportJobs);
+        }),
+      );
+      await Promise.all(jobs.map((job) => job.nightly()));
+    }
+
+    const quiet = new CapturingLogger();
+    await withLogger(false, quiet);
+    expect(quiet.matching('runs on this instance')).toEqual([]);
+    expect(quiet.matching('Skipped')).toEqual([]);
+
+    const warnOnly = new CapturingLogger();
+    await withLogger(['error', 'warn'], warnOnly);
+    expect(warnOnly.matching('runs on this instance')).toEqual([]);
+    expect(warnOnly.matching('Skipped')).toEqual([]);
+  });
+
   it('lets a run overlap the previous one on the owner, like a plain @Cron()', async () => {
     const { jobs } = await instance('a');
     const hold = deferred();

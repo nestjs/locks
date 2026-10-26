@@ -5,6 +5,7 @@ import { LOCK_STORAGE } from '../locks.constants.js';
 import { LOCKS_MODULE_OPTIONS } from '../locks.module-definition.js';
 import type { LocksModuleOptions } from '../interfaces/locks-module-options.interface.js';
 import { InMemoryLockStore } from '../stores/in-memory-lock.store.js';
+import { locksLogger } from '../utils/locks-logger.util.js';
 
 /** The methods `LocksStorage.registerSource()` checks for. */
 export const LOCK_STORE_METHODS = ['acquire', 'renew', 'release'] as const;
@@ -30,11 +31,13 @@ const DEFAULT =
  */
 @Injectable()
 export class LocksStorage {
-  private readonly logger = new Logger('LocksModule');
+  private readonly logger: Logger;
   private registered?: LockStore;
   private active?: LockStore;
 
-  constructor(@Optional() @Inject(LOCKS_MODULE_OPTIONS) private readonly options?: LocksModuleOptions) {}
+  constructor(@Optional() @Inject(LOCKS_MODULE_OPTIONS) private readonly options?: LocksModuleOptions) {
+    this.logger = locksLogger('LocksModule', options?.logger);
+  }
 
   /**
    * Makes `source` the store every lock uses. Call it once, from the constructor of a
