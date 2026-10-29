@@ -16,6 +16,7 @@ import {
   OnOneInstance,
   WithoutOverlapping,
   type Lock,
+  type LockStore,
   type LocksEvent,
   type OnLeadershipAcquired,
   type OnLeadershipLost,
@@ -23,6 +24,7 @@ import {
 import { CapturingLogger, deferred, until } from './helpers.js';
 import { DrizzleLockStore } from './fixtures/database/drizzle-lock.store.js';
 import { openBackends } from './store-backends.js';
+import { lockStoreContract } from '../lib/testing/index.js';
 
 const backends = await openBackends();
 afterAll(async () => {
@@ -440,6 +442,22 @@ for (const backend of backends) {
       expect(await b.app.get(InvoiceExportJob).export()).toBe(true);
       await taken!.release();
     });
+  });
+}
+
+// In this file, after the instances: a file of its own would run alongside, and CI's shared Redis would be flushed under a case.
+for (const backend of backends.filter((backend) => backend.contractStore)) {
+  const title = `the LockStore contract on ${backend.name}${backend.unavailable ? ` (skipped: ${backend.unavailable})` : ''}`;
+
+  describe.skipIf(!!backend.unavailable)(title, () => {
+    let store: LockStore;
+    beforeAll(() => {
+      store = backend.contractStore!();
+    });
+
+    for (const c of lockStoreContract(() => store, { concurrent: true })) {
+      it(c.name, c.run, 30_000);
+    }
   });
 }
 
