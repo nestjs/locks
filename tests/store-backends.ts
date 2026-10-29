@@ -21,8 +21,9 @@ import { migrate as migratePglite } from 'drizzle-orm/pglite/migrator';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { DrizzleLockStore } from './fixtures/database/drizzle-lock.store.js';
+import type { Database } from './fixtures/database/drizzle.js';
 import * as schema from './fixtures/database/schema.js';
-import { RedisLockStore } from './fixtures/redis/redis-lock.store.js';
+import { RedisLockStore, type RedisEval } from './fixtures/redis/redis-lock.store.js';
 import { RedisClient } from './fixtures/redis/redis.client.js';
 import { RedisModule } from './fixtures/redis/redis.module.js';
 import { startPostgres } from './support/postgres.js';
@@ -45,6 +46,8 @@ export interface StoreBackend {
   beforeInit(moduleRef: TestingModule): void;
   /** The store an instance uses, for spying on its calls. */
   storeOf(moduleRef: TestingModule): LockStore;
+  /** The recipe's store outside any app, for the contract suite: over several connections where the server takes them. */
+  contractStore?(): LockStore;
   /** The owner of the live lock on `key`, if any, read from the store's own data. */
   holder(key: string): Promise<string | undefined>;
   /**
@@ -114,13 +117,17 @@ async function pgliteBackend(): Promise<StoreBackend> {
   const db = drizzlePglite(client, { schema });
   await migratePglite(db, { migrationsFolder });
 
-  return sqlBackend(
-    'DrizzleLockStore on PGlite',
-    DrizzleLockStore,
-    () => DrizzleModule.forRoot({ db, autoCloseConnection: false }),
-    async (text, params) => (await client.query<Record<string, unknown>>(text, params)).rows,
-    () => client.close(),
-  );
+  return {
+    ...sqlBackend(
+      'DrizzleLockStore on PGlite',
+      DrizzleLockStore,
+      () => DrizzleModule.forRoot({ db, autoCloseConnection: false }),
+      async (text, params) => (await client.query<Record<string, unknown>>(text, params)).rows,
+      () => client.close(),
+    ),
+    // The recipe is typed for node-postgres; the query builder it calls is the same on PGlite.
+    contractStore: () => new DrizzleLockStore(db as unknown as Database, new LocksStorage()),
+  };
 }
 
 async function postgresBackend(): Promise<StoreBackend> {
@@ -134,17 +141,20 @@ async function postgresBackend(): Promise<StoreBackend> {
   const pool = new pg.Pool({ connectionString: url });
   await migrate(drizzle(pool, { schema }), { migrationsFolder });
 
-  return sqlBackend(
-    name,
-    DrizzleLockStore,
-    // What an application's AppModule registers: a pool per instance, ended in onApplicationShutdown().
-    () => DrizzleModule.forRootAsync({ useFactory: () => ({ drizzle, connection: url, schema }) }),
-    async (text, params) => (await pool.query(text, params)).rows,
-    async () => {
-      await pool.end();
-      await postgres.stop();
-    },
-  );
+  return {
+    ...sqlBackend(
+      name,
+      DrizzleLockStore,
+      // What an application's AppModule registers: a pool per instance, ended in onApplicationShutdown().
+      () => DrizzleModule.forRootAsync({ useFactory: () => ({ drizzle, connection: url, schema }) }),
+      async (text, params) => (await pool.query(text, params)).rows,
+      async () => {
+        await pool.end();
+        await postgres.stop();
+      },
+    ),
+    contractStore: () => new DrizzleLockStore(drizzle(pool, { schema }), new LocksStorage()),
+  };
 }
 
 async function redisBackend(): Promise<StoreBackend> {
@@ -157,6 +167,10 @@ async function redisBackend(): Promise<StoreBackend> {
   const client = new RedisClient(redis.url);
   // The recipe's RedisModule connects each instance to REDIS_URL.
   process.env.REDIS_URL = redis.url;
+  // The recipe calls only eval(): a pool hands each call to the next connection.
+  const pool = Array.from({ length: 8 }, () => new RedisClient(redis.url));
+  let next = 0;
+  const pooled: RedisEval = { eval: (...args) => pool[next++ % pool.length].eval(...args) };
 
   return {
     name,
@@ -164,6 +178,7 @@ async function redisBackend(): Promise<StoreBackend> {
     providers: () => [RedisLockStore],
     beforeInit: () => undefined,
     storeOf: (moduleRef) => moduleRef.get(RedisLockStore),
+    contractStore: () => new RedisLockStore(pooled, new LocksStorage()),
     holder: async (key) => ((await client.command('GET', `locks:key:${key}`)) as string | null) ?? undefined,
     // A key Redis expired and a deleted key are the same thing; the fencing counter stays.
     expire: async (keys) => {
@@ -173,7 +188,7 @@ async function redisBackend(): Promise<StoreBackend> {
       await client.command('FLUSHALL');
     },
     close: async () => {
-      await client.quit();
+      await Promise.all([client, ...pool].map((connection) => connection.quit()));
       delete process.env.REDIS_URL;
       redis.stop();
     },
@@ -192,6 +207,7 @@ function unavailable(name: string, reason: string): StoreBackend {
     providers: fail,
     beforeInit: fail,
     storeOf: fail,
+    contractStore: fail,
     holder: fail,
     expire: fail,
     reset: fail,
