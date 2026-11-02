@@ -7,3 +7,9 @@ export const channels: Record<LocksEvent['type'], Channel> = {
   'leadership-acquired': channel('nestjs:locks:leadership-acquired'),
   'leadership-lost': channel('nestjs:locks:leadership-lost'),
 };
+
+/**
+ * `nestjs:locks:job-skipped`, for `LocksJobSkippedEvent`. Its subscribers run on every skipped
+ * tick and must not throw: Node rethrows their error on the next tick.
+ */
+export const jobSkippedChannel: Channel = channel('nestjs:locks:job-skipped');

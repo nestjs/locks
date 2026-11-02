@@ -3,9 +3,11 @@ import type { TestingModule } from '@nestjs/testing';
 import { LocksContext } from '../lib/context/locks.context.js';
 import { OnOneInstance } from '../lib/decorators/on-one-instance.decorator.js';
 import { WithoutOverlapping } from '../lib/decorators/without-overlapping.decorator.js';
+import { config } from 'rxjs';
+import { LocksEvents } from '../lib/events/locks-events.service.js';
 import { InMemoryLockStore } from '../lib/stores/in-memory-lock.store.js';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
-import { CapturingLogger, deferred, startInstance, until } from './helpers.js';
+import { CapturingLogger, collectSkips, deferred, skippedEvent, startInstance, until } from './helpers.js';
 
 describe('job decorators', () => {
   it('check their options when the class is defined', () => {
@@ -250,6 +252,7 @@ describe('jobs at run time', () => {
       }
     }
     const app = await instance([Jobs]);
+    const skipped = collectSkips(app);
     const running = app.get(Jobs).run();
     await until(() => store.peek('Jobs.run') !== undefined);
     const closing = app.close();
@@ -257,9 +260,92 @@ describe('jobs at run time', () => {
     await clock.advance(0);
     expect(await app.get(Jobs).run()).toBeUndefined();
     expect(logger.matching('DEBUG Skipped Jobs.run: the application is shutting down')).toHaveLength(1);
+    expect(skipped).toEqual([skippedEvent('Jobs.run', 'Jobs.run', 'shutdown')]);
     hold.resolve();
     await Promise.all([running, closing]);
     expect(store.peek('Jobs.run')).toBeUndefined();
+  });
+
+  it('reports a skip on a shared key under the job that was called', async () => {
+    const hold = deferred();
+    @Injectable()
+    class Exports {
+      @WithoutOverlapping({ key: 'exports' })
+      invoices() {
+        return hold.promise;
+      }
+
+      @WithoutOverlapping({ key: 'exports' })
+      orders() {
+        return 'done';
+      }
+    }
+    const app = await instance([Exports]);
+    const skipped = collectSkips(app);
+    const running = app.get(Exports).invoices();
+    await until(() => store.peek('exports') !== undefined);
+    expect(await app.get(Exports).orders()).toBeUndefined();
+    expect(skipped).toEqual([skippedEvent('Exports.orders', 'exports', 'run-lock-unavailable')]);
+    hold.resolve();
+    await running;
+    expect(await app.get(Exports).orders()).toBe('done');
+    expect(skipped).toHaveLength(1);
+  });
+
+  describe('with a skip subscriber that throws synchronously', () => {
+    const throwing = (app: TestingModule) =>
+      app.get(LocksEvents).jobSkips$.subscribe(() => {
+        throw new Error('broken subscriber');
+      });
+    afterEach(() => {
+      config.useDeprecatedSynchronousErrorHandling = false;
+    });
+
+    it('still skips a call whose run lock is taken, and logs the error, not a store failure', async () => {
+      const hold = deferred();
+      @Injectable()
+      class Jobs {
+        @WithoutOverlapping()
+        run() {
+          return hold.promise;
+        }
+      }
+      const app = await instance([Jobs]);
+      throwing(app);
+      const running = app.get(Jobs).run();
+      await until(() => store.peek('Jobs.run') !== undefined);
+      config.useDeprecatedSynchronousErrorHandling = true;
+      await expect(app.get(Jobs).run()).resolves.toBeUndefined();
+      config.useDeprecatedSynchronousErrorHandling = false;
+      expect(logger.matching('ERROR A subscriber to the "job-skipped" events threw')).toHaveLength(1);
+      expect(logger.matching('did not run')).toEqual([]);
+      hold.resolve();
+      await running;
+    });
+
+    it('still skips a call once shutdown began', async () => {
+      const hold = deferred();
+      @Injectable()
+      class Jobs {
+        @WithoutOverlapping()
+        run() {
+          return hold.promise;
+        }
+      }
+      const app = await instance([Jobs]);
+      throwing(app);
+      const running = app.get(Jobs).run();
+      await until(() => store.peek('Jobs.run') !== undefined);
+      const closing = app.close();
+      apps = [];
+      await clock.advance(0);
+      config.useDeprecatedSynchronousErrorHandling = true;
+      await expect(app.get(Jobs).run()).resolves.toBeUndefined();
+      config.useDeprecatedSynchronousErrorHandling = false;
+      expect(logger.matching('ERROR A subscriber to the "job-skipped" events threw')).toHaveLength(1);
+      hold.resolve();
+      await Promise.all([running, closing]);
+    });
   });
 });
 
