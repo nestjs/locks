@@ -5,6 +5,8 @@ import { getEventListeners } from 'node:events';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
 import { LocksContext } from '../lib/context/locks.context.js';
 import { LockLostError } from '../lib/errors/lock-lost.error.js';
+import type { LocksJobSkippedEvent } from '../lib/events/locks-events.interface.js';
+import { LocksEvents } from '../lib/events/locks-events.service.js';
 import type { Lock } from '../lib/lock/lock.js';
 import { Locks } from '../lib/locks.service.js';
 import { LocksModule } from '../lib/locks.module.js';
@@ -15,6 +17,8 @@ import { CapturingLogger, deferred, startInstance, until } from './helpers.js';
 
 /** Every run of every job, across the instances of a test. */
 let runs: { job: string; instance: string; fencingToken?: number; signal?: AbortSignal }[] = [];
+/** Every skipped call, from `LocksEvents.jobSkips$`, across the instances of a test. */
+let skipped: (LocksJobSkippedEvent & { instance: string })[] = [];
 /** When set, jobs wait for it before finishing. */
 let gate: Promise<void> | undefined;
 
@@ -67,6 +71,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       logger,
     });
     app.get(ReportJobs).instance = name;
+    app.get(LocksEvents).jobSkips$.subscribe((event) => skipped.push({ ...event, instance: name }));
     apps.push(app);
 
     return { app, jobs: app.get(ReportJobs) };
@@ -77,6 +82,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     store = new InMemoryLockStore({ clock });
     apps = [];
     runs = [];
+    skipped = [];
     gate = undefined;
     logger = new CapturingLogger();
   });
@@ -117,6 +123,11 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(store.peek('reports:nightly:owner')).toBeDefined();
     expect(logger.matching('ReportJobs.nightly runs on this instance (lease "reports:nightly:owner", fencing token 1)')).toHaveLength(1);
     expect(logger.matching('DEBUG Skipped ReportJobs.nightly: it runs on another instance')).toHaveLength(6);
+    // One event per skipped call, under the job's key, not its lease's.
+    expect(skipped.map(({ instance }) => instance).sort()).toEqual(['b', 'b', 'b', 'c', 'c', 'c']);
+    expect(new Set(skipped.map(({ instance: _, ...event }) => JSON.stringify(event)))).toEqual(
+      new Set([JSON.stringify({ type: 'job-skipped', job: 'ReportJobs.nightly', key: 'reports:nightly', reason: 'ownership-unavailable' })]),
+    );
   });
 
   it('lets a run overlap the previous one on the owner, like a plain @Cron()', async () => {
@@ -141,11 +152,16 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(await instances[1]!.jobs.reconcile()).toBeUndefined(); // another instance
     expect(logger.matching('Skipped ReportJobs.reconcile: a run is still in progress')).toHaveLength(1);
     expect(logger.matching('Skipped ReportJobs.reconcile: it runs on another instance')).toHaveLength(1);
+    expect(skipped).toEqual([
+      { type: 'job-skipped', job: 'ReportJobs.reconcile', key: 'ReportJobs.reconcile', reason: 'run-lock-unavailable', instance: 'a' },
+      { type: 'job-skipped', job: 'ReportJobs.reconcile', key: 'ReportJobs.reconcile', reason: 'ownership-unavailable', instance: 'b' },
+    ]);
     hold.resolve();
     await running;
     gate = undefined;
     await instances[0]!.jobs.reconcile();
     expect(runs).toHaveLength(2);
+    expect(skipped).toHaveLength(2); // a run that resolves undefined is no skip
     // Each run holds the run lock, with a token of its own.
     expect(runs[1]!.fencingToken).toBeGreaterThan(runs[0]!.fencingToken!);
     expect(store.peek('ReportJobs.reconcile')).toBeUndefined(); // released after each run
@@ -214,6 +230,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     apps.splice(apps.indexOf(a.app), 1);
     await clock.advance(0);
     expect(await a.jobs.nightly()).toBeUndefined(); // no new runs once shutdown began
+    expect(skipped).toEqual([{ type: 'job-skipped', job: 'ReportJobs.nightly', key: 'reports:nightly', reason: 'shutdown', instance: 'a' }]);
     expect(store.peek('reports:nightly:owner')).toBeDefined(); // still A's: its run goes on
     hold.resolve();
     await closing;
@@ -241,6 +258,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       'ReportJobs.nightly did not run: the lock store failed (ECONNREFUSED)',
     );
     expect(runs).toEqual([]);
+    expect(skipped).toEqual([]); // a failed tick is an error, not a skip
     expect(await jobs.nightly()).toBe('done'); // the next tick tries again
   });
 
@@ -256,6 +274,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       await clock.advance('10s');
       expect(await Promise.all(ticks)).toEqual([failed, failed]);
       expect(runs).toEqual([]);
+      expect(skipped).toEqual([]);
       expect(await jobs.nightly()).toBe('done');
     });
 
@@ -273,12 +292,14 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       expect(await Promise.all(ticks)).toEqual([undefined, undefined]);
       expect(logger.matching('DEBUG Skipped ReportJobs.nightly: the application is shutting down')).toHaveLength(2);
       expect(logger.matching('did not run')).toEqual([]);
+      expect(skipped.map(({ reason }) => reason)).toEqual(['shutdown', 'shutdown']);
 
       const release = vi.spyOn(store, 'release');
       answer.resolve();
       await until(() => release.mock.calls.length === 1);
       expect(store.peek('reports:nightly:owner')).toBeUndefined();
       expect(runs).toEqual([]);
+      expect(skipped).toHaveLength(2); // the lease it gave back adds none
     });
 
     it('at shutdown, skips a tick still waiting for its run lock', async () => {
@@ -291,6 +312,9 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       await app.close();
       expect(await tick).toBeUndefined();
       expect(runs).toEqual([]);
+      expect(skipped).toEqual([
+        { type: 'job-skipped', job: 'ReportJobs.reconcile', key: 'ReportJobs.reconcile', reason: 'shutdown', instance: 'a' },
+      ]);
     });
   });
 
@@ -546,6 +570,8 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(runs).toEqual([]);
     expect(store.peek('reports:nightly:owner')).toBeUndefined();
     expect(logger.matching('DEBUG Skipped ReportJobs.nightly: it runs on another instance')).toHaveLength(3);
+    // Not another owner: a grant too late to use. Still one event per call that waited on it.
+    expect(skipped.map(({ reason }) => reason)).toEqual(['ownership-unavailable', 'ownership-unavailable', 'ownership-unavailable']);
     expect(await jobs.nightly()).toBe('done'); // the next tick, answered in time
   });
 

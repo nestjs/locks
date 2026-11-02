@@ -23,7 +23,7 @@ export type {
 // Errors
 export * from './errors/index.js';
 
-// Events: `LocksEvents.events$`, and `nestjs:locks:*` diagnostics channels
+// Events: `LocksEvents.events$` and `jobSkips$`, and `nestjs:locks:*` diagnostics channels
 export * from './events/index.js';
 
 // Storage: implement `LockStore` in a provider and register it with `LocksStorage`; the

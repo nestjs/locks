@@ -7,3 +7,6 @@ export const channels: Record<LocksEvent['type'], Channel> = {
   'leadership-acquired': channel('nestjs:locks:leadership-acquired'),
   'leadership-lost': channel('nestjs:locks:leadership-lost'),
 };
+
+/** `nestjs:locks:job-skipped`, for `LocksJobSkippedEvent`. */
+export const jobSkippedChannel: Channel = channel('nestjs:locks:job-skipped');

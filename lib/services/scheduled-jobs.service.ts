@@ -4,6 +4,8 @@ import { LockKeys } from './lock-keys.service.js';
 import type { Lock } from '../lock/lock.js';
 import { JOB_DEFINITION, LINGER, LOCKS_INTERNALS } from '../locks.constants.js';
 import { runInLockScope } from '../context/locks.context.js';
+import type { LocksJobSkipReason } from '../events/locks-events.interface.js';
+import { LocksEvents } from '../events/locks-events.service.js';
 import { Locks, type LocksInternals } from '../locks.service.js';
 import { decoratorsOf, describeJob, jobRunners, type JobDefinition, type JobRunner } from '../utils/job-registry.util.js';
 
@@ -13,6 +15,13 @@ import { decoratorsOf, describeJob, jobRunners, type JobDefinition, type JobRunn
  * then doesn't run the tick the owner just ran.
  */
 const HANDOVER_GRACE = 1_000;
+
+/** How the debug log says each skip reason. */
+const SKIP_REASONS: Record<LocksJobSkipReason, string> = {
+  'ownership-unavailable': 'it runs on another instance',
+  'run-lock-unavailable': 'a run is still in progress',
+  shutdown: 'the application is shutting down',
+};
 
 /** What an application shares between the jobs with one key: the lease, and the runs in progress. */
 class KeyState {
@@ -80,6 +89,7 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
     private readonly scanner: MetadataScanner,
     private readonly locks: Locks,
     private readonly keys: LockKeys,
+    private readonly events: LocksEvents,
   ) {}
 
   onModuleInit() {
@@ -178,13 +188,14 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
   }
 
   private runner(definition: JobDefinition, job: string, state: KeyState, internals: LocksInternals): JobRunner {
-    const skip = (why: string) => {
-      this.logger.debug(`Skipped ${job}: ${why}`);
+    const skip = (reason: LocksJobSkipReason) => {
+      this.logger.debug(`Skipped ${job}: ${SKIP_REASONS[reason]}`);
+      this.events.emitJobSkipped({ type: 'job-skipped', job, key: state.key, reason });
       return undefined;
     };
     const run = async (invoke: () => unknown): Promise<unknown> => {
       if (this.stopping) {
-        return skip('the application is shutting down');
+        return skip('shutdown');
       }
 
       let ownership: Lock | null = null;
@@ -194,7 +205,7 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
         if (definition.oneInstance) {
           ownership = await state.ensureOwnership(definition.oneInstance.ttl ?? internals.defaultTtl, job, this.shutdown.signal);
           if (!ownership) {
-            return skip('it runs on another instance');
+            return skip('ownership-unavailable');
           }
         }
         if (definition.withoutOverlapping) {
@@ -202,13 +213,14 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
             signal: this.shutdown.signal,
           });
           if (!runLock) {
-            return skip('a run is still in progress');
+            return skip('run-lock-unavailable');
           }
         }
       } catch (error) {
         if (error === this.shutdown.signal.reason) {
-          // Shutdown stopped the wait for the store; a lock it grants later goes back.
-          return skip('the application is shutting down');
+          // Shutdown stopped the wait for the store; a lock it grants later goes back. (Locks
+          // stops granting only after this abort, so a shutdown never shows as an unavailable lock.)
+          return skip('shutdown');
         }
         // Fail closed: without the lock, running could mean running twice.
         throw new Error(`${job} did not run: the lock store failed (${(error as Error)?.message ?? String(error)})`, {

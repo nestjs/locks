@@ -3,6 +3,8 @@ import type { TestingModule } from '@nestjs/testing';
 import { LocksContext } from '../lib/context/locks.context.js';
 import { OnOneInstance } from '../lib/decorators/on-one-instance.decorator.js';
 import { WithoutOverlapping } from '../lib/decorators/without-overlapping.decorator.js';
+import type { LocksJobSkippedEvent } from '../lib/events/locks-events.interface.js';
+import { LocksEvents } from '../lib/events/locks-events.service.js';
 import { InMemoryLockStore } from '../lib/stores/in-memory-lock.store.js';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
 import { CapturingLogger, deferred, startInstance, until } from './helpers.js';
@@ -250,6 +252,8 @@ describe('jobs at run time', () => {
       }
     }
     const app = await instance([Jobs]);
+    const skipped: LocksJobSkippedEvent[] = [];
+    app.get(LocksEvents).jobSkips$.subscribe((event) => skipped.push(event));
     const running = app.get(Jobs).run();
     await until(() => store.peek('Jobs.run') !== undefined);
     const closing = app.close();
@@ -257,9 +261,37 @@ describe('jobs at run time', () => {
     await clock.advance(0);
     expect(await app.get(Jobs).run()).toBeUndefined();
     expect(logger.matching('DEBUG Skipped Jobs.run: the application is shutting down')).toHaveLength(1);
+    expect(skipped).toEqual([{ type: 'job-skipped', job: 'Jobs.run', key: 'Jobs.run', reason: 'shutdown' }]);
     hold.resolve();
     await Promise.all([running, closing]);
     expect(store.peek('Jobs.run')).toBeUndefined();
+  });
+
+  it('reports a skip on a shared key under the job that was called', async () => {
+    const hold = deferred();
+    @Injectable()
+    class Exports {
+      @WithoutOverlapping({ key: 'exports' })
+      invoices() {
+        return hold.promise;
+      }
+
+      @WithoutOverlapping({ key: 'exports' })
+      orders() {
+        return 'done';
+      }
+    }
+    const app = await instance([Exports]);
+    const skipped: LocksJobSkippedEvent[] = [];
+    app.get(LocksEvents).jobSkips$.subscribe((event) => skipped.push(event));
+    const running = app.get(Exports).invoices();
+    await until(() => store.peek('exports') !== undefined);
+    expect(await app.get(Exports).orders()).toBeUndefined();
+    expect(skipped).toEqual([{ type: 'job-skipped', job: 'Exports.orders', key: 'exports', reason: 'run-lock-unavailable' }]);
+    hold.resolve();
+    await running;
+    expect(await app.get(Exports).orders()).toBe('done');
+    expect(skipped).toHaveLength(1);
   });
 });
 

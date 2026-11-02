@@ -1,8 +1,9 @@
 import type { TestingModule } from '@nestjs/testing';
 import { subscribe, unsubscribe } from 'node:diagnostics_channel';
+import { config } from 'rxjs';
 import { LocksContext } from '../lib/context/locks.context.js';
 import { LockLostError, LockNotAcquiredError, LocksError, LockStoreTimeoutError } from '../lib/errors/index.js';
-import type { LocksEvent } from '../lib/events/locks-events.interface.js';
+import type { LocksEvent, LocksJobSkippedEvent } from '../lib/events/locks-events.interface.js';
 import { LocksEvents } from '../lib/events/locks-events.service.js';
 import type { LockClock } from '../lib/interfaces/lock-clock.interface.js';
 import type { LockAcquireResult } from '../lib/interfaces/lock-store.interface.js';
@@ -712,6 +713,64 @@ describe('LocksEvents', () => {
     events.onApplicationShutdown();
     events.emit(event);
     expect(streamed).toEqual([event]);
+  });
+
+  describe('job skips', () => {
+    const skip: LocksJobSkippedEvent = { type: 'job-skipped', job: 'Jobs.run', key: 'jobs:run', reason: 'run-lock-unavailable' };
+
+    it('publishes each on nestjs:locks:job-skipped and jobSkips$, not on events$', () => {
+      const events = new LocksEvents();
+      const streamed: unknown[] = [];
+      const skips: LocksJobSkippedEvent[] = [];
+      events.events$.subscribe((e) => streamed.push(e));
+      events.jobSkips$.subscribe((e) => skips.push(e));
+      const published: unknown[] = [];
+      const others: unknown[] = [];
+      const onSkipped = (e: unknown) => published.push(e);
+      const onOther = (e: unknown) => others.push(e);
+      subscribe('nestjs:locks:job-skipped', onSkipped);
+      subscribe('nestjs:locks:lock-lost', onOther);
+
+      try {
+        events.emitJobSkipped(skip);
+      } finally {
+        unsubscribe('nestjs:locks:job-skipped', onSkipped);
+        unsubscribe('nestjs:locks:lock-lost', onOther);
+      }
+
+      expect(published).toEqual([skip]);
+      expect(published[0]).toBe(skips[0]); // the same payload on both
+      expect(skips).toEqual([skip]);
+      expect(streamed).toEqual([]);
+      expect(others).toEqual([]);
+    });
+
+    it('streams skips with nobody on the channel, completes jobSkips$ at shutdown, and streams nothing after', () => {
+      const events = new LocksEvents();
+      const skips: LocksJobSkippedEvent[] = [];
+      let completed = false;
+      events.jobSkips$.subscribe({ next: (e) => skips.push(e), complete: () => (completed = true) });
+      events.emitJobSkipped(skip);
+      events.onApplicationShutdown();
+      events.emitJobSkipped(skip);
+      expect(skips).toEqual([skip]);
+      expect(completed).toBe(true);
+    });
+
+    it('does not throw to the job when a subscriber throws', async () => {
+      const events = new LocksEvents();
+      events.jobSkips$.subscribe(() => {
+        throw new Error('broken subscriber');
+      });
+      const reported = deferred<unknown>();
+      config.onUnhandledError = reported.resolve;
+      try {
+        expect(() => events.emitJobSkipped(skip)).not.toThrow();
+        expect(await reported.promise).toMatchObject({ message: 'broken subscriber' });
+      } finally {
+        config.onUnhandledError = null;
+      }
+    });
   });
 });
 
