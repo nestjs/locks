@@ -264,6 +264,16 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(await jobs.nightly()).toBe('done'); // the next tick tries again
   });
 
+  it('fails closed when the store rejects with undefined before shutdown, instead of skipping as if shutting down', async () => {
+    const { jobs } = await instance('a');
+    vi.spyOn(store, 'acquire').mockRejectedValueOnce(undefined);
+    await expect(jobs.nightly()).rejects.toThrow('ReportJobs.nightly did not run: the lock store failed (undefined)');
+    expect(logger.matching('Skipped ReportJobs.nightly')).toEqual([]);
+    expect(runs).toEqual([]);
+    expect(skipped).toEqual([]);
+    expect(await jobs.nightly()).toBe('done');
+  });
+
   describe('on a store that never answers', () => {
     const failed =
       'ReportJobs.nightly did not run: the lock store failed (InMemoryLockStore.acquire() for the lock "reports:nightly:owner" ' +

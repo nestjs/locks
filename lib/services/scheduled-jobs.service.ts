@@ -215,7 +215,9 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
           skipped = runLock ? undefined : 'run-lock-unavailable';
         }
       } catch (error) {
-        if (error !== this.shutdown.signal.reason) {
+        // Before the abort, `reason` is `undefined`: a store that rejects with `undefined` failed,
+        // it wasn't stopped by a shutdown.
+        if (!this.shutdown.signal.aborted || error !== this.shutdown.signal.reason) {
           // Fail closed: without the lock, running could mean running twice.
           throw new Error(`${job} did not run: the lock store failed (${(error as Error)?.message ?? String(error)})`, {
             cause: error,
