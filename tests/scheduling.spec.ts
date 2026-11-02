@@ -13,7 +13,7 @@ import { LocksModule } from '../lib/locks.module.js';
 import { OnOneInstance } from '../lib/decorators/on-one-instance.decorator.js';
 import { WithoutOverlapping } from '../lib/decorators/without-overlapping.decorator.js';
 import { InMemoryLockStore } from '../lib/stores/in-memory-lock.store.js';
-import { CapturingLogger, deferred, startInstance, until } from './helpers.js';
+import { CapturingLogger, deferred, skippedEvent, startInstance, until } from './helpers.js';
 
 /** Every run of every job, across the instances of a test. */
 let runs: { job: string; instance: string; fencingToken?: number; signal?: AbortSignal }[] = [];
@@ -124,9 +124,11 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(logger.matching('ReportJobs.nightly runs on this instance (lease "reports:nightly:owner", fencing token 1)')).toHaveLength(1);
     expect(logger.matching('DEBUG Skipped ReportJobs.nightly: it runs on another instance')).toHaveLength(6);
     // One event per skipped call, under the job's key, not its lease's.
-    expect(skipped.map(({ instance }) => instance).sort()).toEqual(['b', 'b', 'b', 'c', 'c', 'c']);
-    expect(new Set(skipped.map(({ instance: _, ...event }) => JSON.stringify(event)))).toEqual(
-      new Set([JSON.stringify({ type: 'job-skipped', job: 'ReportJobs.nightly', key: 'reports:nightly', reason: 'ownership-unavailable' })]),
+    expect(skipped.sort((x, y) => x.instance.localeCompare(y.instance))).toEqual(
+      ['b', 'b', 'b', 'c', 'c', 'c'].map((instance) => ({
+        ...skippedEvent('ReportJobs.nightly', 'reports:nightly', 'ownership-unavailable'),
+        instance,
+      })),
     );
   });
 
@@ -153,8 +155,8 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     expect(logger.matching('Skipped ReportJobs.reconcile: a run is still in progress')).toHaveLength(1);
     expect(logger.matching('Skipped ReportJobs.reconcile: it runs on another instance')).toHaveLength(1);
     expect(skipped).toEqual([
-      { type: 'job-skipped', job: 'ReportJobs.reconcile', key: 'ReportJobs.reconcile', reason: 'run-lock-unavailable', instance: 'a' },
-      { type: 'job-skipped', job: 'ReportJobs.reconcile', key: 'ReportJobs.reconcile', reason: 'ownership-unavailable', instance: 'b' },
+      { ...skippedEvent('ReportJobs.reconcile', 'ReportJobs.reconcile', 'run-lock-unavailable'), instance: 'a' },
+      { ...skippedEvent('ReportJobs.reconcile', 'ReportJobs.reconcile', 'ownership-unavailable'), instance: 'b' },
     ]);
     hold.resolve();
     await running;
@@ -230,7 +232,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
     apps.splice(apps.indexOf(a.app), 1);
     await clock.advance(0);
     expect(await a.jobs.nightly()).toBeUndefined(); // no new runs once shutdown began
-    expect(skipped).toEqual([{ type: 'job-skipped', job: 'ReportJobs.nightly', key: 'reports:nightly', reason: 'shutdown', instance: 'a' }]);
+    expect(skipped).toEqual([{ ...skippedEvent('ReportJobs.nightly', 'reports:nightly', 'shutdown'), instance: 'a' }]);
     expect(store.peek('reports:nightly:owner')).toBeDefined(); // still A's: its run goes on
     hold.resolve();
     await closing;
@@ -312,9 +314,7 @@ describe('@OnOneInstance() and @WithoutOverlapping()', () => {
       await app.close();
       expect(await tick).toBeUndefined();
       expect(runs).toEqual([]);
-      expect(skipped).toEqual([
-        { type: 'job-skipped', job: 'ReportJobs.reconcile', key: 'ReportJobs.reconcile', reason: 'shutdown', instance: 'a' },
-      ]);
+      expect(skipped).toEqual([{ ...skippedEvent('ReportJobs.reconcile', 'ReportJobs.reconcile', 'shutdown'), instance: 'a' }]);
     });
   });
 

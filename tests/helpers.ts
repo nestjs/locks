@@ -1,6 +1,8 @@
 import type { LoggerService, ModuleMetadata } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import { Test, type TestingModule } from '@nestjs/testing';
+import type { LocksJobSkippedEvent, LocksJobSkipReason } from '../lib/events/locks-events.interface.js';
+import { LocksEvents } from '../lib/events/locks-events.service.js';
 import { LocksModule } from '../lib/locks.module.js';
 import type { LocksModuleForRootOptions } from '../lib/interfaces/locks-module-options.interface.js';
 import { LocksStorage } from '../lib/storage/locks.storage.js';
@@ -57,6 +59,18 @@ export async function startInstance(options: InstanceOptions = {}): Promise<Test
   await moduleRef.init();
 
   return moduleRef;
+}
+
+/** The event for a skipped call to `job`. */
+export function skippedEvent(job: string, key: string, reason: LocksJobSkipReason): LocksJobSkippedEvent {
+  return { type: 'job-skipped', job, key, reason };
+}
+
+/** The skipped calls of `app`, from `LocksEvents.jobSkips$`, as they come. */
+export function collectSkips(app: TestingModule): LocksJobSkippedEvent[] {
+  const skipped: LocksJobSkippedEvent[] = [];
+  app.get(LocksEvents).jobSkips$.subscribe((event) => skipped.push(event));
+  return skipped;
 }
 
 /** A promise with its resolve and reject, to hold a job open. */

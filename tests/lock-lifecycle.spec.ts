@@ -10,7 +10,7 @@ import type { LockAcquireResult } from '../lib/interfaces/lock-store.interface.j
 import { Locks } from '../lib/locks.service.js';
 import { InMemoryLockStore } from '../lib/stores/in-memory-lock.store.js';
 import { ManualLockClock } from '../lib/testing/manual-lock-clock.js';
-import { CapturingLogger, deferred, startInstance, until } from './helpers.js';
+import { CapturingLogger, deferred, skippedEvent, startInstance, until } from './helpers.js';
 
 /** Whether `promise` has settled, without waiting for it. */
 async function settled(promise: Promise<unknown>): Promise<boolean> {
@@ -716,7 +716,7 @@ describe('LocksEvents', () => {
   });
 
   describe('job skips', () => {
-    const skip: LocksJobSkippedEvent = { type: 'job-skipped', job: 'Jobs.run', key: 'jobs:run', reason: 'run-lock-unavailable' };
+    const skip = skippedEvent('Jobs.run', 'jobs:run', 'run-lock-unavailable');
 
     it('publishes each on nestjs:locks:job-skipped and jobSkips$, not on events$', () => {
       const events = new LocksEvents();
@@ -745,30 +745,41 @@ describe('LocksEvents', () => {
       expect(others).toEqual([]);
     });
 
-    it('streams skips with nobody on the channel, completes jobSkips$ at shutdown, and streams nothing after', () => {
+    it('streams skips with nobody on the channel, and nothing on either after shutdown', () => {
       const events = new LocksEvents();
       const skips: LocksJobSkippedEvent[] = [];
       let completed = false;
       events.jobSkips$.subscribe({ next: (e) => skips.push(e), complete: () => (completed = true) });
       events.emitJobSkipped(skip);
       events.onApplicationShutdown();
-      events.emitJobSkipped(skip);
+      const published: unknown[] = [];
+      const onSkipped = (e: unknown) => published.push(e);
+      subscribe('nestjs:locks:job-skipped', onSkipped);
+      try {
+        events.emitJobSkipped(skip);
+      } finally {
+        unsubscribe('nestjs:locks:job-skipped', onSkipped);
+      }
       expect(skips).toEqual([skip]);
       expect(completed).toBe(true);
+      expect(published).toEqual([]);
     });
 
-    it('does not throw to the job when a subscriber throws', async () => {
-      const events = new LocksEvents();
-      events.jobSkips$.subscribe(() => {
-        throw new Error('broken subscriber');
-      });
-      const reported = deferred<unknown>();
-      config.onUnhandledError = reported.resolve;
+    it('does not throw to the job when a subscriber throws, and rxjs reports the error', () => {
+      vi.useFakeTimers();
+      const reported = vi.fn();
+      config.onUnhandledError = reported;
       try {
+        const events = new LocksEvents();
+        events.jobSkips$.subscribe(() => {
+          throw new Error('broken subscriber');
+        });
         expect(() => events.emitJobSkipped(skip)).not.toThrow();
-        expect(await reported.promise).toMatchObject({ message: 'broken subscriber' });
+        vi.runAllTimers();
+        expect(reported).toHaveBeenCalledWith(expect.objectContaining({ message: 'broken subscriber' }));
       } finally {
         config.onUnhandledError = null;
+        vi.useRealTimers();
       }
     });
   });

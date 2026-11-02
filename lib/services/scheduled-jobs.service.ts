@@ -200,32 +200,33 @@ export class ScheduledJobs implements OnModuleInit, OnModuleDestroy {
 
       let ownership: Lock | null = null;
       let runLock: Lock | null = null;
+      let skipped: LocksJobSkipReason | undefined;
 
+      // Only the store calls: a skip is reported after, so nothing else can pass for a store failure.
       try {
         if (definition.oneInstance) {
           ownership = await state.ensureOwnership(definition.oneInstance.ttl ?? internals.defaultTtl, job, this.shutdown.signal);
-          if (!ownership) {
-            return skip('ownership-unavailable');
-          }
+          skipped = ownership ? undefined : 'ownership-unavailable';
         }
-        if (definition.withoutOverlapping) {
+        if (!skipped && definition.withoutOverlapping) {
           runLock = await internals.tryAcquire(state.key, definition.withoutOverlapping.ttl ?? internals.defaultTtl, {
             signal: this.shutdown.signal,
           });
-          if (!runLock) {
-            return skip('run-lock-unavailable');
-          }
+          skipped = runLock ? undefined : 'run-lock-unavailable';
         }
       } catch (error) {
-        if (error === this.shutdown.signal.reason) {
-          // Shutdown stopped the wait for the store; a lock it grants later goes back. (Locks
-          // stops granting only after this abort, so a shutdown never shows as an unavailable lock.)
-          return skip('shutdown');
+        if (error !== this.shutdown.signal.reason) {
+          // Fail closed: without the lock, running could mean running twice.
+          throw new Error(`${job} did not run: the lock store failed (${(error as Error)?.message ?? String(error)})`, {
+            cause: error,
+          });
         }
-        // Fail closed: without the lock, running could mean running twice.
-        throw new Error(`${job} did not run: the lock store failed (${(error as Error)?.message ?? String(error)})`, {
-          cause: error,
-        });
+        // Shutdown stopped the wait for the store; a lock it grants later goes back. (Locks
+        // stops granting only after this abort, so a shutdown never shows as an unavailable lock.)
+        skipped = 'shutdown';
+      }
+      if (skipped) {
+        return skip(skipped);
       }
 
       const lock = (runLock ?? ownership)!;
