@@ -148,6 +148,34 @@ describe('@LeaderElection(): edge cases', () => {
     expect(log).toEqual(['lost 1 (AbortError)', 'leads 2']);
   });
 
+  it('steps down after calling every participant, when one onLeadershipAcquired() throws synchronously', async () => {
+    const log: string[] = [];
+    @Injectable()
+    @LeaderElection('feed', { ttl: '3s' })
+    class Feed {
+      onLeadershipAcquired() {
+        throw new Error('feed unreachable');
+      }
+      onLeadershipLost(lock: Lock) {
+        log.push(`feed lost ${lock.fencingToken}`);
+      }
+    }
+    @Injectable()
+    @LeaderElection('feed', { ttl: '3s' })
+    class Consumer {
+      onLeadershipAcquired(lock: Lock) {
+        log.push(`consumer leads ${lock.fencingToken} (held: ${lock.held})`);
+      }
+      onLeadershipLost(lock: Lock) {
+        log.push(`consumer lost ${lock.fencingToken}`);
+      }
+    }
+    await instance([Feed, Consumer]);
+    await clock.advance(0);
+    expect(log).toEqual(['consumer leads 1 (held: true)', 'feed lost 1', 'consumer lost 1']);
+    expect(store.peek('feed')).toBeUndefined();
+  });
+
   it('logs an onLeadershipLost() that fails, without anything else changing', async () => {
     @Injectable()
     @LeaderElection('feed', { ttl: '3s' })

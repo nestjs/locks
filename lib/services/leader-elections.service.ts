@@ -151,7 +151,7 @@ class Election {
         (result as Promise<unknown>).then(undefined, failed);
       }
     } catch (error) {
-      failed(error);
+      Promise.reject(error).then(undefined, failed);
     }
   }
 }
