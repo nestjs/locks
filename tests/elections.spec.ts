@@ -237,6 +237,27 @@ describe('@LeaderElection(): edge cases', () => {
     expect(clock.pendingTimers).toBe(0);
   });
 
+  it('campaigns for a provider registered with useFactory or useValue', async () => {
+    const leaders: string[] = [];
+    @Injectable()
+    @LeaderElection('feed')
+    class Feed {
+      constructor(private readonly name: string) {}
+      onLeadershipAcquired(lock: Lock) {
+        leaders.push(`${this.name} ${lock.fencingToken}`);
+      }
+    }
+    await instance([{ provide: Feed, useFactory: () => new Feed('factory') }]);
+    await clock.advance(0);
+    expect(leaders).toEqual(['factory 1']);
+    await instance([{ provide: Feed, useValue: new Feed('value') }]);
+    await clock.advance(0);
+    expect(store.peek('feed')!.fencingToken).toBe(1);
+    await apps.shift()!.close();
+    await clock.advance('10s');
+    expect(leaders).toEqual(['factory 1', 'value 2']);
+  });
+
   it('runs one election per key, each on its own lease', async () => {
     const leaders: string[] = [];
     @Injectable()
