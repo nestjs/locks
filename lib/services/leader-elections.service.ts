@@ -178,12 +178,18 @@ export class LeaderElections implements OnModuleInit, OnApplicationBootstrap, On
     const ttls = new Map<string, number | undefined>();
 
     for (const wrapper of this.discovery.getProviders()) {
-      const { instance, metatype } = wrapper;
-      const definition = (metatype as { [LEADER_ELECTION]?: LeaderElectionDefinition } | null)?.[LEADER_ELECTION];
-      if (!definition || !instance || typeof instance !== 'object') {
+      const { instance } = wrapper;
+      if (!instance || typeof instance !== 'object') {
         continue;
       }
-      const name = (metatype as { name?: string }).name;
+      // The instance's class, not the wrapper's metatype: for a useFactory or useValue
+      // provider, that is the factory or nothing.
+      const metatype = instance.constructor as { [LEADER_ELECTION]?: LeaderElectionDefinition; name?: string } | undefined;
+      const definition = metatype?.[LEADER_ELECTION];
+      if (!definition) {
+        continue;
+      }
+      const name = metatype.name;
       if (!wrapper.isDependencyTreeStatic()) {
         throw new Error(`@LeaderElection("${definition.key}") on ${name}: use it on a singleton provider (not request-scoped or transient)`);
       }
