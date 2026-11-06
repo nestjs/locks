@@ -1,6 +1,6 @@
 {
   "name": "@nestjs/locks",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Distributed locks for NestJS: run a scheduled job on one instance, keep runs from overlapping, and elect a leader, with leases and fencing tokens.",
   "keywords": [
     "nestjs",
