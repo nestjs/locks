@@ -203,11 +203,11 @@ export class Locks implements BeforeApplicationShutdown {
     }
     const store = this.storage.source;
     const owner = randomUUID();
-    const ask = <T>(method: keyof LockStore, answer: Promise<T>, late?: (answer: T) => void) =>
-      this.ask(store, method, key, answer, { late });
-    const giveBack = () => ask('release', store.release(key, owner)).catch(() => undefined);
+    const ask = <T>(method: keyof LockStore, call: () => Promise<T>, late?: (answer: T) => void) =>
+      this.ask(store, method, key, call, { late });
+    const giveBack = () => ask('release', () => store.release(key, owner)).catch(() => undefined);
     const sentAt = this.clock.now();
-    const result = await this.ask(store, 'acquire', key, store.acquire(key, owner, ttl), {
+    const result = await this.ask(store, 'acquire', key, () => store.acquire(key, owner, ttl), {
       signal,
       late: (answer) => {
         if (answer?.acquired) {
@@ -286,10 +286,10 @@ export class Locks implements BeforeApplicationShutdown {
     store: LockStore,
     method: keyof LockStore,
     key: string,
-    answer: Promise<T>,
+    call: () => Promise<T>,
     options: { signal?: AbortSignal; late?: (answer: T) => void } = {},
   ): Promise<T> {
-    return storeCall(answer, {
+    return storeCall(call, {
       ...options,
       clock: this.clock,
       timeout: this.storeTimeout,

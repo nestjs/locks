@@ -16,8 +16,13 @@ export interface StoreCallOptions<T> {
  * `signal` aborts first (its reason): a store that answers late, or never (a saturated pool, a
  * failover, a client queueing commands offline), doesn't keep the caller waiting. An answer
  * that comes after that goes to `late`, and a failure after that is nobody's to handle.
+ *
+ * `call` makes the call: a store that throws instead of rejecting, or answers with a plain value
+ * (a hand-written store), still gives a rejection or an answer here, never an error the caller
+ * can't catch.
  */
-export function storeCall<T>(answer: Promise<T>, { clock, timeout, timedOut, signal, late }: StoreCallOptions<T>): Promise<T> {
+export function storeCall<T>(call: () => Promise<T>, { clock, timeout, timedOut, signal, late }: StoreCallOptions<T>): Promise<T> {
+  const answer = new Promise<T>((resolve) => resolve(call()));
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const settle = () => {

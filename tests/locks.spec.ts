@@ -236,6 +236,15 @@ describe('Locks', () => {
       await expect(locks.withLock('k', () => 42)).resolves.toBe(42);
       expect(logger.matching('Could not release the lock "k"')).toHaveLength(1);
     });
+
+    it("logs a release that throws instead of rejecting, and still resolves the callback's result", async () => {
+      const { locks } = await instance();
+      vi.spyOn(store, 'release').mockImplementationOnce(() => {
+        throw new Error('pool closed');
+      });
+      await expect(locks.withLock('k', () => 42)).resolves.toBe(42);
+      expect(logger.matching('Could not release the lock "k"')).toHaveLength(1);
+    });
   });
 
   describe('a lost lock', () => {
@@ -343,6 +352,21 @@ describe('Locks', () => {
       expect(store.peek('k')).toBeUndefined();
     });
 
+    it('happens for the other locks when the store throws on one of them instead of rejecting', async () => {
+      const { app, locks } = await instance();
+      const first = (await locks.acquire('first'))!;
+      const second = (await locks.acquire('second'))!;
+      vi.spyOn(store, 'release').mockImplementationOnce(() => {
+        throw new Error('pool closed');
+      });
+      await app.close();
+      apps = [];
+      expect(first.signal.aborted).toBe(true);
+      expect(second.signal.aborted).toBe(true);
+      expect(store.peek('second')).toBeUndefined();
+      expect(logger.matching('Could not release the lock "first" at shutdown')).toHaveLength(1);
+    });
+
     it("happens before the app's own onApplicationShutdown hooks, where it closes the store's connection", async () => {
       // The tutorial's DatabaseModule ends its pool in onApplicationShutdown, and Nest runs
       // that phase root module first, then the imported modules in import order: a module
@@ -403,5 +427,37 @@ describe('Locks', () => {
     apps.push(app);
     await app.get(Locks).withLock('k', () => clock.advance('1s'));
     expect(calls).toEqual(['acquire k 3000', 'renew k 3000', 'release k']);
+  });
+
+  it('works with a store that answers with plain values instead of promises', async () => {
+    const held = new Map<string, { owner: string; expiresAt: number }>();
+    const holds = (key: string, owner: string) => held.get(key)?.owner === owner && held.get(key)!.expiresAt > clock.now();
+    let tokens = 0;
+    const calls: string[] = [];
+    const plain = {
+      acquire(key: string, owner: string, ttl: number): LockAcquireResult {
+        calls.push(`acquire ${key}`);
+        if ((held.get(key)?.expiresAt ?? 0) > clock.now()) {
+          return { acquired: false };
+        }
+        held.set(key, { owner, expiresAt: clock.now() + ttl });
+        return { acquired: true, fencingToken: ++tokens };
+      },
+      renew(key: string, owner: string, ttl: number): boolean {
+        calls.push(`renew ${key}`);
+        return holds(key, owner) && (held.set(key, { owner, expiresAt: clock.now() + ttl }), true);
+      },
+      release(key: string, owner: string): boolean {
+        calls.push(`release ${key}`);
+        return holds(key, owner) && held.delete(key);
+      },
+    };
+    const app = await startInstance({ store: plain as never, locks: { clock, ttl: '3s', storeTimeout: '10s' }, logger });
+    apps.push(app);
+    await expect(app.get(Locks).withLock('k', async () => (await clock.advance('1s'), 42))).resolves.toBe(42);
+    await clock.advance('30s');
+    expect(calls).toEqual(['acquire k', 'renew k', 'release k']);
+    expect(held.size).toBe(0);
+    expect(logger.matching('ERROR')).toEqual([]);
   });
 });
