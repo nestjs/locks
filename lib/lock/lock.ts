@@ -18,7 +18,7 @@ export interface LockInternals {
    * A call to `store`, bounded by `storeTimeout`: it rejects with `LockStoreTimeoutError` when
    * the store doesn't answer in time, and an answer that comes after that goes to `late`.
    */
-  ask<T>(method: 'renew' | 'release', answer: Promise<T>, late?: (answer: T) => void): Promise<T>;
+  ask<T>(method: 'renew' | 'release', call: () => Promise<T>, late?: (answer: T) => void): Promise<T>;
   clock: LockClock;
   /** The lock was lost (not released). */
   onLost(lock: Lock, error: LockLostError): void;
@@ -111,12 +111,12 @@ export class Lock {
     }
     this.end('released');
     const { store, key, owner, ask } = this.internals;
-    await (ms > 0 ? ask('renew', store.renew(key, owner, ms)) : this.giveBack());
+    await (ms > 0 ? ask('renew', () => store.renew(key, owner, ms)) : this.giveBack());
   }
 
   private giveBack(): Promise<boolean> {
     const { store, key, owner, ask } = this.internals;
-    return ask('release', store.release(key, owner));
+    return ask('release', () => store.release(key, owner));
   }
 
   /**
@@ -167,7 +167,7 @@ export class Lock {
     let renewed: boolean;
 
     try {
-      renewed = await ask('renew', store.renew(key, owner, ttl), (late) => {
+      renewed = await ask('renew', () => store.renew(key, owner, ttl), (late) => {
         // Renewed after it timed out, and after this process gave up on the lock: hand it back
         // (once, however many timed-out renewals land).
         if (late && this.state === 'lost') {

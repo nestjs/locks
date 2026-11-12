@@ -165,6 +165,28 @@ describe('jobs at run time', () => {
     expect(ran).not.toHaveBeenCalled();
   });
 
+  it("resolves the job's result and ends its run when the store throws on the release instead of rejecting", async () => {
+    const signals: AbortSignal[] = [];
+    @Injectable()
+    class Export {
+      constructor(private readonly context: LocksContext) {}
+      @WithoutOverlapping({ key: 'export' })
+      async run() {
+        signals.push(this.context.signal!);
+        return 'exported';
+      }
+    }
+    const app = await instance([Export]);
+    vi.spyOn(store, 'release').mockImplementationOnce(() => {
+      throw new Error('pool closed');
+    });
+    await expect(app.get(Export).run()).resolves.toBe('exported');
+    expect(signals[0]!.aborted).toBe(true);
+    expect(logger.matching('Could not release the lock "export" after Export.run')).toHaveLength(1);
+    await clock.advance('30s');
+    await expect(app.get(Export).run()).resolves.toBe('exported');
+  });
+
   it('runs jobs on controllers too', async () => {
     @Controller()
     class ReportsController {
